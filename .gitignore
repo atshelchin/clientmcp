@@ -1,0 +1,6 @@
+target/
+node_modules/
+crates/worker/build/
+.dev.vars
+.wrangler/
+sdk/js/dist/

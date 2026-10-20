@@ -1,0 +1,13 @@
+{
+  "name": "clientmcp-conformance",
+  "private": true,
+  "type": "module",
+  "description": "Conformance tests for any ClientMCP bridge, using the official MCP SDKs as agents",
+  "scripts": {
+    "test": "node --test --test-concurrency=1 conformance.test.mjs"
+  },
+  "devDependencies": {
+    "@modelcontextprotocol/client": "2.3.1",
+    "@modelcontextprotocol/sdk": "1.32.1"
+  }
+}

@@ -1,0 +1,26 @@
+name = "clientmcp"
+main = "build/worker/shim.mjs"
+compatibility_date = "2026-05-01"
+routes = [{ pattern = "bridge.clientmcp.dev", custom_domain = true }]
+
+[build]
+command = "worker-build --release"
+
+[[durable_objects.bindings]]
+name = "CLIENTS"
+class_name = "ClientObject"
+
+[[migrations]]
+tag = "v1"
+new_sqlite_classes = ["ClientObject"]
+
+[vars]
+# Tool call timeout in seconds.
+CLIENTMCP_CALL_TIMEOUT = "120"
+# Browser origins allowed on /mcp: comma-separated, or "*". Empty allows none.
+CLIENTMCP_ALLOWED_ORIGINS = ""
+
+# The token secret is a secret, not a var:
+#   wrangler secret put CLIENTMCP_SECRET
+# For `wrangler dev`, put it in .dev.vars:
+#   CLIENTMCP_SECRET=<at least 32 bytes>

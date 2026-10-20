@@ -1,0 +1,14 @@
+[workspace]
+resolver = "3"
+members = ["crates/core", "crates/server", "crates/worker", "crates/bench"]
+
+[workspace.package]
+version = "1.0.0"
+edition = "2024"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/atshelchin/clientmcp"
+rust-version = "1.88"
+
+[profile.release]
+lto = true
+codegen-units = 1

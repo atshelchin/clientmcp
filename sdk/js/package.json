@@ -1,0 +1,22 @@
+{
+  "name": "clientmcp",
+  "version": "1.0.0",
+  "description": "Expose a running browser, desktop or mobile application as an MCP server through a ClientMCP bridge",
+  "type": "module",
+  "license": "MIT OR Apache-2.0",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "default": "./dist/index.js"
+    }
+  },
+  "files": ["dist"],
+  "sideEffects": false,
+  "scripts": {
+    "build": "tsc -p ."
+  },
+  "devDependencies": {
+    "typescript": "^5.9.0"
+  },
+  "keywords": ["mcp", "model-context-protocol", "ai", "agents", "websocket"]
+}

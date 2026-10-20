@@ -1,0 +1,18 @@
+# The bridge behind Caddy, which obtains and renews the TLS certificate.
+#   1. Point DNS for your domain at this host and set it in Caddyfile.
+#   2. CLIENTMCP_SECRET=$(openssl rand -hex 32) docker compose up -d
+services:
+  clientmcp:
+    build: ..
+    restart: unless-stopped
+    environment:
+      CLIENTMCP_SECRET: ${CLIENTMCP_SECRET:?set CLIENTMCP_SECRET}
+  caddy:
+    image: caddy:2
+    restart: unless-stopped
+    ports: ["80:80", "443:443"]
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy:/data
+volumes:
+  caddy:

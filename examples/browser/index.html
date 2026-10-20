@@ -1,0 +1,130 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Shared Todos</title>
+<style>
+  :root { --fg: #1d1d1f; --muted: #6e6e73; --line: #e5e5ea; --accent: #0a66c2; --bg: #fff; }
+  @media (prefers-color-scheme: dark) { :root { --fg: #f5f5f7; --muted: #a1a1a6; --line: #38383a; --accent: #4c9bff; --bg: #1c1c1e; } }
+  body { font: 16px/1.5 system-ui, sans-serif; color: var(--fg); background: var(--bg); max-width: 32rem; margin: 3rem auto; padding: 0 1rem; }
+  h1 { font-size: 1.5rem; margin: 0 0 .25rem; }
+  #status { color: var(--muted); font-size: .875rem; margin: 0 0 1.5rem; }
+  #status[data-status="online"]::before { content: "● "; color: #34c759; }
+  form { display: flex; gap: .5rem; margin-bottom: 1rem; }
+  input[type=text] { flex: 1; font: inherit; padding: .5rem .75rem; border: 1px solid var(--line); border-radius: .5rem; background: transparent; color: inherit; }
+  button { font: inherit; padding: .5rem 1rem; border: 0; border-radius: .5rem; background: var(--accent); color: #fff; cursor: pointer; }
+  ul { list-style: none; padding: 0; margin: 0; }
+  li { display: flex; align-items: center; gap: .75rem; padding: .625rem 0; border-bottom: 1px solid var(--line); }
+  li.done span { text-decoration: line-through; color: var(--muted); }
+  li span { flex: 1; }
+  li button { background: none; color: var(--muted); padding: 0 .25rem; }
+  #log { margin-top: 1.5rem; font-size: .8125rem; color: var(--muted); }
+</style>
+</head>
+<body>
+<h1>Shared Todos</h1>
+<p id="status">offline</p>
+<form id="add"><input type="text" name="title" placeholder="Add a todo" autocomplete="off" required><button>Add</button></form>
+<ul id="todos"></ul>
+<div id="log"></div>
+
+<script type="module">
+  // Run with ?bridge=wss://bridge.example.com/connect&token=<client token>
+  import { ClientMCP } from "../../sdk/js/dist/index.js";
+
+  // ── Application state and actions: the only implementation, used by the UI and by agents ──
+  const todos = [];
+  let nextId = 1;
+  const find = (id) => {
+    const todo = todos.find((t) => t.id === id);
+    if (!todo) throw new Error(`No todo with id ${id}`);
+    return todo;
+  };
+  const actions = {
+    list: () => todos.map((t) => ({ ...t })),
+    add(title) {
+      if (typeof title !== "string" || !title.trim()) throw new Error("A todo needs a title");
+      const todo = { id: nextId++, title: title.trim(), done: false };
+      todos.push(todo);
+      render();
+      return { ...todo };
+    },
+    setDone(id, done = true) {
+      find(id).done = done;
+      render();
+      return { ...find(id) };
+    },
+    remove(id) {
+      const todo = find(id);
+      todos.splice(todos.indexOf(todo), 1);
+      render();
+      return { removed: id };
+    },
+  };
+
+  // ── UI for humans ──
+  const list = document.querySelector("#todos");
+  function render() {
+    list.replaceChildren(...todos.map((todo) => {
+      const item = document.createElement("li");
+      item.className = todo.done ? "done" : "";
+      item.dataset.id = todo.id;
+      const box = Object.assign(document.createElement("input"), { type: "checkbox", checked: todo.done });
+      box.onchange = () => actions.setDone(todo.id, box.checked);
+      const title = Object.assign(document.createElement("span"), { textContent: todo.title });
+      const remove = Object.assign(document.createElement("button"), { textContent: "✕", title: "Remove" });
+      remove.onclick = () => actions.remove(todo.id);
+      item.append(box, title, remove);
+      return item;
+    }));
+  }
+  document.querySelector("#add").onsubmit = (event) => {
+    event.preventDefault();
+    actions.add(event.target.title.value);
+    event.target.reset();
+  };
+  const log = (text) => document.querySelector("#log").prepend(Object.assign(document.createElement("div"), { textContent: text }));
+
+  // ── MCP for agents: the same actions ──
+  const params = new URLSearchParams(location.search);
+  const mcp = new ClientMCP({
+    url: params.get("bridge") ?? "ws://127.0.0.1:8080/connect",
+    token: params.get("token") ?? "",
+    instructions: "A todo list the user is looking at. Changes appear on their screen immediately.",
+    onStatus: (status, detail) => {
+      const el = document.querySelector("#status");
+      el.dataset.status = status;
+      el.textContent = detail ? `${status} (${detail.code} ${detail.reason})` : status;
+    },
+  });
+  const id = { type: "object", properties: { id: { type: "integer" } }, required: ["id"] };
+  mcp.expose("list_todos", {
+    description: "List the todos",
+    annotations: { readOnlyHint: true },
+    handler: () => ({ todos: actions.list() }),
+  });
+  mcp.expose("add_todo", {
+    description: "Add a todo",
+    inputSchema: { type: "object", properties: { title: { type: "string" } }, required: ["title"] },
+    handler: ({ title }) => (log(`agent added “${title}”`), actions.add(title)),
+  });
+  mcp.expose("complete_todo", {
+    description: "Mark a todo as done",
+    inputSchema: id,
+    handler: ({ id }) => actions.setDone(id),
+  });
+  mcp.expose("remove_todo", {
+    description: "Remove a todo. The user is asked to confirm.",
+    inputSchema: id,
+    annotations: { destructiveHint: true },
+    handler: ({ id }) => {
+      // A consequential action: the human decides.
+      if (!confirm(`An agent wants to remove “${find(id).title}”. Allow?`)) throw new Error("The user declined");
+      return actions.remove(id);
+    },
+  });
+  mcp.connect();
+</script>
+</body>
+</html>

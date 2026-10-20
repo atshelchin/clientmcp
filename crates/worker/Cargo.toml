@@ -1,0 +1,21 @@
+[package]
+name = "clientmcp-worker"
+description = "ClientMCP bridge for Cloudflare Workers and Durable Objects"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+clientmcp-core = { path = "../core" }
+futures-channel = { version = "0.3.34", features = ["sink"] }
+futures-util = "0.3.34"
+getrandom = { version = "0.4.3", features = ["wasm_js"] }
+js-sys = "0.3.106"
+wasm-bindgen = "0.2.129"
+wasm-bindgen-futures = "0.4.79"
+worker = "0.8.7"
