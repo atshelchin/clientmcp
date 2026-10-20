@@ -1,0 +1,4 @@
+User-agent: *
+Disallow:
+
+Sitemap: https://clientmcp.dev/sitemap.xml

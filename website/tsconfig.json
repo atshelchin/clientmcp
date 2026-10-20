@@ -1,0 +1,12 @@
+{
+	"extends": "$app/tsconfig",
+	"compilerOptions": {
+		"strict": true,
+		"types": ["$app/types", "node", "./worker-configuration.d.ts"],
+		// worker-configuration.d.ts imports the built worker (.svelte-kit/cloudflare/_worker.js)
+		// for its types; checking that compiled JavaScript reports hundreds of false errors after
+		// a build. The site's own code is all TypeScript.
+		"checkJs": false
+	},
+	"include": ["src", "vite.config.ts", "playwright.config.ts"]
+}
