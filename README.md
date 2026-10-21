@@ -163,10 +163,12 @@ authentication, origin checks and CORS, both MCP eras, header validation,
 `x-mcp-header`, notification streams, streamed slow calls, concurrency,
 timeouts, cancellation in both eras (checked before the call timeout could
 cancel instead), disconnection, replacement, size limits and tool validation. It
-passes unchanged against the native server, the Docker image and the Worker
-running in workerd. Beyond the suite: the browser example was exercised end to
-end in Chrome — agent changes appeared in the UI, user edits were visible to the
-agent, a declined confirmation reached the agent as a tool error, and the page
+passes unchanged against the native server, the Docker image, the Worker
+running in workerd and the deployed Worker (`bridge.clientmcp.dev`, where the
+call-timeout case is skipped: it needs `CLIENTMCP_CALL_TIMEOUT` of 5 or less).
+Beyond the suite: the browser example was exercised end to end in Chrome —
+agent changes appeared in the UI, user edits were visible to the agent, a
+declined confirmation reached the agent as a tool error, and the page
 reconnected and re-registered after a bridge restart — and Claude Code, as a
 real agent, listed and added todos in a running application through the bridge.
 

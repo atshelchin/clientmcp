@@ -86,6 +86,19 @@ Worker then tells the object to cancel. Second, a JSON response that waits for a
 human for a minute is cut off by common proxy defaults (nginx: 60 s). Fast calls
 stay plain JSON.
 
+**A hang-up in the first second.** On Cloudflare itself (not in workerd), an
+agent hanging up on a pending JSON response ends the Worker's invocation
+without dropping anything, so nothing told the object, and the application
+kept the call until the call timeout. The request's abort signal
+(`enable_request_signal`) is the signal there: the Worker asks the object to
+cancel, and the object also watches its own request's signal. That cancel can
+overtake the call it is about, so the object remembers it for a few seconds
+and cancels the call on arrival. Measured on `bridge.clientmcp.dev`: hang-ups
+at 0.6–0.8 s were never cancelled before, and are now cancelled within
+0.25 s, like hang-ups after the switch to SSE. A client behind an HTTP
+proxy hides the difference: the proxy holds the connection to Cloudflare open
+until the next write.
+
 **A fixed 4 MiB message limit.** Making the limit part of the protocol lets the
 SDK turn an oversized result into a tool error before sending it. Otherwise the
 bridge has to close the connection mid-message; with the rest of the message

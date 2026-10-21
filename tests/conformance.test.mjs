@@ -3,6 +3,7 @@
 
 import assert from "node:assert/strict";
 import http from "node:http";
+import https from "node:https";
 import { afterEach, describe, test } from "node:test";
 import { RISK_META, accepted, completed, rejected, toolResult } from "../sdk/js/dist/index.js";
 import {
@@ -75,7 +76,7 @@ describe("front door", () => {
   test("a client handshake without the subprotocol is refused with HTTP 400", async () => {
     const status = await new Promise((resolve, reject) => {
       const url = new URL(WS_URL.replace(/^ws/, "http"));
-      const req = http.request(url, {
+      const req = (url.protocol === "https:" ? https : http).request(url, {
         headers: { Connection: "Upgrade", Upgrade: "websocket", "Sec-WebSocket-Version": "13", "Sec-WebSocket-Key": "dGhlIHNhbXBsZSBub25jZQ==" },
       });
       req.on("response", (res) => (res.socket.destroy(), resolve(res.statusCode)));

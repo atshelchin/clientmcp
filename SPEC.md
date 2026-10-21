@@ -425,9 +425,11 @@ document its limits. The reference bridge uses:
   waiting for changes does not keep the object awake either. The tool set is
   kept in Durable Object storage only so that it survives hibernation; it is
   deleted when the client disconnects. The Worker notices an agent hanging up
-  on a streamed call when a keep-alive write fails, and asks the object to
-  cancel the call. When the platform restarts an object (e.g. on deploy), its
-  streams end without the final result and agents listen again.
+  on a call by the request's abort signal, or on a streamed call when a
+  keep-alive write fails, and asks the object to cancel the call; a cancel
+  that overtakes its call cancels it on arrival. When the platform restarts
+  an object (e.g. on deploy), its streams end without the final result and
+  agents listen again.
 - *Single process.* A map from client ID to connection, with a notification
   channel per client, is the whole state. A single instance serves all
   clients; running several instances requires routing all requests for a

@@ -6,6 +6,7 @@
 
 mod client_object;
 
+use std::cell::RefCell;
 use std::future::Future;
 use std::pin::{Pin, pin};
 use std::rc::Rc;
@@ -17,8 +18,10 @@ use clientmcp_core::http::{
     self, Admitted, ClientRefusal, Headers as CoreHeaders, Route, SSE_HEADERS, SSE_KEEPALIVE,
 };
 use clientmcp_core::wire::{CLOSE_UNAUTHORIZED, MAX_MESSAGE_BYTES, SUBPROTOCOL};
-use futures_channel::mpsc;
+use futures_channel::{mpsc, oneshot};
 use futures_util::{SinkExt, StreamExt};
+use wasm_bindgen::JsCast;
+use wasm_bindgen::closure::Closure;
 use worker::*;
 
 pub use client_object::ClientObject;
@@ -104,19 +107,22 @@ async fn agent(
             let forwarded = forward(&req, &body, Some(&key))?;
             let stub = clients(env)?.get_by_name(&admitted.client)?;
             let pending = Box::pin(async move { stub.fetch_with_request(forwarded).await });
+            let canceller = Canceller::new(ctx, clients(env)?.get_by_name(&admitted.client)?, key);
+            // An agent hanging up before the answer: on Cloudflare the
+            // invocation then ends without dropping anything, so only the
+            // request's signal says so (the `enable_request_signal` flag).
+            let on_hang_up = canceller.clone();
+            on_abort(&req, move || {
+                if on_hang_up.cancel() {
+                    console_log!("clientmcp: an agent hung up; its call is cancelled");
+                }
+            });
             if call.streamable {
-                let canceller = clients(env)?.get_by_name(&admitted.client)?;
-                stream_call(
-                    pending,
-                    CancelOnDrop {
-                        ctx,
-                        stub: Some(canceller),
-                        key,
-                    },
-                )
-                .await?
+                stream_call(pending, CancelOnDrop(canceller)).await?
             } else {
-                pending.await?
+                let response = pending.await;
+                canceller.disarm();
+                response?
             }
         }
         // Everything else needs the client's state.
@@ -154,7 +160,8 @@ fn forward(req: &Request, body: &[u8], cancel_key: Option<&str>) -> Result<Reque
 /// Answers a call (SPEC §4.3). One that takes longer than [`CALL_KEEPALIVE`]
 /// becomes an SSE stream of keep-alive comments ending with the response: a
 /// write to an agent that has gone away cancels the stream, which drops
-/// `cancel`, which tells the client's object to cancel the call.
+/// `cancel`, which tells the client's object to cancel the call. (A hang-up
+/// before that is the request's abort signal's, see [`agent`].)
 async fn stream_call(
     mut pending: Pin<Box<impl Future<Output = Result<Response>> + 'static>>,
     mut cancel: CancelOnDrop,
@@ -180,24 +187,29 @@ async fn stream_call(
     sse_response(Response::from_stream(events)?)
 }
 
-/// Tells the client's object to cancel a call, unless disarmed first.
-struct CancelOnDrop {
-    ctx: Rc<Context>,
-    stub: Option<Stub>,
-    key: String,
-}
+/// Tells the client's object to cancel a call, once, unless disarmed first.
+#[derive(Clone)]
+struct Canceller(Rc<RefCell<Option<Cancel>>>);
 
-impl CancelOnDrop {
-    fn disarm(&mut self) {
-        self.stub = None;
+/// What a cancel needs: the invocation to keep alive, the object, the key.
+type Cancel = (Rc<Context>, Stub, String);
+
+impl Canceller {
+    fn new(ctx: Rc<Context>, stub: Stub, key: String) -> Self {
+        Canceller(Rc::new(RefCell::new(Some((ctx, stub, key)))))
     }
-}
 
-impl Drop for CancelOnDrop {
-    fn drop(&mut self) {
-        let Some(stub) = self.stub.take() else { return };
+    fn disarm(&self) {
+        self.0.borrow_mut().take();
+    }
+
+    /// Whether this sent the cancel (it was neither disarmed nor sent).
+    fn cancel(&self) -> bool {
+        let Some((ctx, stub, key)) = self.0.borrow_mut().take() else {
+            return false;
+        };
         let headers = Headers::new();
-        let _ = headers.set(CANCEL_KEY, &self.key);
+        let _ = headers.set(CANCEL_KEY, &key);
         let init = RequestInit {
             method: Method::Post,
             headers,
@@ -205,10 +217,47 @@ impl Drop for CancelOnDrop {
         };
         if let Ok(req) = Request::new_with_init("https://client/cancel", &init) {
             // The agent is gone; `wait_until` keeps the Worker running to deliver this.
-            self.ctx.wait_until(async move {
+            ctx.wait_until(async move {
                 let _ = stub.fetch_with_request(req).await;
             });
         }
+        true
+    }
+}
+
+/// Cancels the call when dropped, unless disarmed first.
+struct CancelOnDrop(Canceller);
+
+impl CancelOnDrop {
+    fn disarm(&mut self) {
+        self.0.disarm();
+    }
+}
+
+impl Drop for CancelOnDrop {
+    fn drop(&mut self) {
+        self.0.cancel();
+    }
+}
+
+/// Runs `f` if the request's sender goes away before the response is done.
+pub(crate) fn on_abort(req: &Request, f: impl FnOnce() + 'static) {
+    let signal = req.inner().signal();
+    if signal.aborted() {
+        return f();
+    }
+    let listener = Closure::once_into_js(f);
+    signal.set_onabort(Some(listener.unchecked_ref()));
+}
+
+/// Resolves if the request's sender goes away before the response is done.
+pub(crate) async fn aborted(req: &Request) {
+    let (tx, rx) = oneshot::channel();
+    on_abort(req, move || {
+        let _ = tx.send(());
+    });
+    if rx.await.is_err() {
+        std::future::pending::<()>().await; // never aborted
     }
 }
 
@@ -308,7 +357,10 @@ pub(crate) fn websocket_response(client: WebSocket) -> Result<Response> {
         .empty())
 }
 
-async fn either_or<A: Future, B: Future>(a: A, b: B) -> std::result::Result<A::Output, B::Output> {
+pub(crate) async fn either_or<A: Future, B: Future>(
+    a: A,
+    b: B,
+) -> std::result::Result<A::Output, B::Output> {
     let mut a = pin!(a);
     let mut b = pin!(b);
     std::future::poll_fn(|cx| {

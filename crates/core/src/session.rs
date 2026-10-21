@@ -184,11 +184,14 @@ impl<O: Outbox> Session<O> {
         }
     }
 
-    /// Cancels the call with [`Call::cancel_key`] `key`, if it is in flight.
-    pub fn cancel(&mut self, key: &str) {
-        if let Some(id) = self.keyed.get(key).cloned() {
-            self.abandon(&id);
-        }
+    /// Cancels the call with [`Call::cancel_key`] `key`, if it is in flight;
+    /// says whether it was.
+    pub fn cancel(&mut self, key: &str) -> bool {
+        let Some(id) = self.keyed.get(key).cloned() else {
+            return false;
+        };
+        self.abandon(&id);
+        true
     }
 
     pub fn in_flight(&self) -> usize {

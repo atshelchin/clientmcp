@@ -1,6 +1,9 @@
 name = "clientmcp"
 main = "build/worker/shim.mjs"
 compatibility_date = "2026-05-01"
+# Request.signal on incoming requests: how a hang-up before a call's answer is
+# seen (src/lib.rs, on_abort).
+compatibility_flags = ["enable_request_signal"]
 routes = [{ pattern = "bridge.clientmcp.dev", custom_domain = true }]
 
 [build]

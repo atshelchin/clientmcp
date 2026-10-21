@@ -7,6 +7,7 @@
 //! object awake, so they are never lost to hibernation.
 
 use std::cell::{Cell, RefCell};
+use std::collections::VecDeque;
 
 use clientmcp_core::MAX_LISTENERS;
 use clientmcp_core::agent::{self, Op};
@@ -16,7 +17,7 @@ use clientmcp_core::tools::ToolSet;
 use clientmcp_core::wire::{CLOSE_PROTOCOL, CLOSE_REPLACED, PING, PONG};
 use worker::*;
 
-use crate::{CANCEL_KEY, config, convert, core_headers, websocket_response};
+use crate::{CANCEL_KEY, aborted, config, convert, core_headers, either_or, websocket_response};
 
 /// Storage key of the last accepted `register` message.
 const REGISTER: &str = "register";
@@ -27,6 +28,10 @@ const LISTENER: &str = "listen";
 pub const CHANGED: &str = "changed";
 /// `WebSocket.OPEN`.
 const OPEN: u16 = 1;
+/// How many cancels of calls not yet arrived are remembered, and for how long
+/// (ms): an overtaken call arrives within moments.
+const EARLY_CANCELS: usize = 64;
+const EARLY_CANCEL_MS: u64 = 10_000;
 
 #[durable_object]
 pub struct ClientObject {
@@ -34,6 +39,9 @@ pub struct ClientObject {
     env: Env,
     current: RefCell<Option<Current>>,
     loaded: Cell<bool>,
+    /// Keys cancelled before their call arrived, and when: the Worker's
+    /// cancel for an agent that hung up can overtake the call it forwarded.
+    cancelled_early: RefCell<VecDeque<(String, u64)>>,
 }
 
 /// The client connection and its session.
@@ -70,6 +78,7 @@ impl DurableObject for ClientObject {
             env,
             current: RefCell::new(None),
             loaded: Cell::new(false),
+            cancelled_early: RefCell::new(VecDeque::new()),
         }
     }
 
@@ -80,7 +89,7 @@ impl DurableObject for ClientObject {
             "/cancel" => {
                 if let Some(key) = req.headers().get(CANCEL_KEY)? {
                     self.load().await;
-                    self.with(|s| s.map(|s| s.cancel(&key)));
+                    self.cancel_or_remember(key);
                 }
                 Response::empty()
             }
@@ -192,10 +201,27 @@ impl ClientObject {
             Op::CallTool(mut call) => {
                 // The Worker's key, so that it can cancel the call (see lib.rs).
                 call.cancel_key = req.headers().get(CANCEL_KEY)?;
+                if call
+                    .cancel_key
+                    .as_ref()
+                    .is_some_and(|key| self.was_cancelled(key))
+                {
+                    return convert(call.respond(agent::Outcome::Cancelled));
+                }
                 let timeout =
                     Delay::from(config(&self.env).map_err(Error::RustError)?.call_timeout);
-                let outcome = session::call(self, &call, timeout).await;
-                call.respond(outcome)
+                // The Worker's request is aborted when its agent hangs up and
+                // Cloudflare ends the Worker's invocation. Dropping the call
+                // then cancels it (`session::call`'s guard).
+                match either_or(session::call(self, &call, timeout), aborted(&req)).await {
+                    Ok(outcome) => call.respond(outcome),
+                    Err(()) => {
+                        console_log!(
+                            "clientmcp: the Worker's request went away; its call is cancelled"
+                        );
+                        call.respond(agent::Outcome::Cancelled)
+                    }
+                }
             }
             Op::Cancel(key) => {
                 self.with(|s| s.map(|s| s.cancel(&key)));
@@ -264,6 +290,29 @@ impl ClientObject {
             }
         }
         Ok(())
+    }
+
+    /// The Worker's cancel of the call with `key`: one that has not arrived
+    /// yet is cancelled when it does. (Not an agent's own cancel: that one is
+    /// often late, and an agent may reuse the request ID it names. A legacy
+    /// key is made of that ID too, hence the short memory.)
+    fn cancel_or_remember(&self, key: String) {
+        if !self.with(|s| s.is_some_and(|s| s.cancel(&key))) {
+            let mut early = self.cancelled_early.borrow_mut();
+            if early.len() == EARLY_CANCELS {
+                early.pop_front();
+            }
+            early.push_back((key, Date::now().as_millis()));
+        }
+    }
+
+    /// Whether the call with `key` was cancelled moments before it arrived.
+    fn was_cancelled(&self, key: &str) -> bool {
+        let now = Date::now().as_millis();
+        let mut early = self.cancelled_early.borrow_mut();
+        early.retain(|(_, at)| now.saturating_sub(*at) < EARLY_CANCEL_MS);
+        let found = early.iter().position(|(k, _)| k == key);
+        found.map(|i| early.remove(i)).is_some()
     }
 
     fn announce(&self) {
