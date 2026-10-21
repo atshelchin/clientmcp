@@ -401,6 +401,8 @@ impl std::error::Error for Close {}
 
 type TokenFuture = Pin<Box<dyn Future<Output = Result<String, String>> + Send>>;
 type StatusFn = Arc<dyn Fn(Status, Option<&Close>) + Send + Sync>;
+type DialFuture = Pin<Box<dyn Future<Output = std::io::Result<tokio::net::TcpStream>> + Send>>;
+type DialFn = Arc<dyn Fn(String, u16) -> DialFuture + Send + Sync>;
 
 /// Where the client token comes from.
 #[derive(Clone)]
@@ -419,6 +421,10 @@ pub struct Options {
     pub instructions: Option<String>,
     /// Called whenever the status changes, with the close that caused it.
     pub on_status: Option<StatusFn>,
+    /// Opens the TCP connection to the bridge's host and port, e.g. through
+    /// the application's proxy; TLS and the WebSocket handshake follow on it.
+    /// By default, a direct connection.
+    pub dial: Option<DialFn>,
 }
 
 impl Options {
@@ -428,7 +434,19 @@ impl Options {
             token: TokenSource::Fixed(token.into()),
             instructions: None,
             on_status: None,
+            dial: None,
         }
+    }
+
+    /// Dial the bridge with `f(host, port)`, e.g. through a proxy.
+    #[must_use]
+    pub fn dial<F, Fut>(mut self, f: F) -> Self
+    where
+        F: Fn(String, u16) -> Fut + Send + Sync + 'static,
+        Fut: Future<Output = std::io::Result<tokio::net::TcpStream>> + Send + 'static,
+    {
+        self.dial = Some(Arc::new(move |host, port| Box::pin(f(host, port))));
+        self
     }
 
     #[must_use]
@@ -681,7 +699,7 @@ async fn run(shared: Arc<Shared>, id: u64, stop: CancellationToken) {
                     TokenSource::Fixed(token) => token.clone(),
                     TokenSource::Fresh(source) => source().await?,
                 };
-                open(&shared.options.url, &token).await
+                open(&shared.options.url, &token, shared.options.dial.as_ref()).await
             } => opened,
         };
         let detail = match opened {
@@ -753,21 +771,40 @@ fn tls() -> Result<Arc<rustls::ClientConfig>, String> {
         .clone()
 }
 
-async fn open(url: &str, token: &str) -> Result<Socket, String> {
+async fn open(url: &str, token: &str, dial: Option<&DialFn>) -> Result<Socket, String> {
     let mut request = url.into_client_request().map_err(|e| e.to_string())?;
     let protocols =
         HeaderValue::from_str(&format!("{SUBPROTOCOL}, {token}")).map_err(|e| e.to_string())?;
     request
         .headers_mut()
         .insert("Sec-WebSocket-Protocol", protocols);
-    let connector = match request.uri().scheme_str() {
-        Some("wss") => Some(Connector::Rustls(tls()?)),
-        _ => None,
+    let secure = request.uri().scheme_str() == Some("wss");
+    let connector = if secure {
+        Some(Connector::Rustls(tls()?))
+    } else {
+        None
     };
-    let (socket, _) =
-        tokio_tungstenite::connect_async_tls_with_config(request, None, false, connector)
+    let (socket, _) = match dial {
+        None => tokio_tungstenite::connect_async_tls_with_config(request, None, false, connector)
             .await
-            .map_err(|e| e.to_string())?;
+            .map_err(|e| e.to_string())?,
+        Some(dial) => {
+            let host = request.uri().host().unwrap_or_default();
+            // `[::1]` in a URL is `::1` to a socket.
+            let host = host
+                .trim_start_matches('[')
+                .trim_end_matches(']')
+                .to_owned();
+            let port = request
+                .uri()
+                .port_u16()
+                .unwrap_or(if secure { 443 } else { 80 });
+            let stream = dial(host, port).await.map_err(|e| e.to_string())?;
+            tokio_tungstenite::client_async_tls_with_config(request, stream, None, connector)
+                .await
+                .map_err(|e| e.to_string())?
+        }
+    };
     Ok(socket)
 }
 

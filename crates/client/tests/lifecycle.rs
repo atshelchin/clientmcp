@@ -375,3 +375,27 @@ async fn a_wss_url_goes_through_rustls_and_a_failed_handshake_is_retried() {
     .await;
     client.close();
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_dial_hook_opens_every_connection() {
+    let bridge = Bridge::start().await;
+    let dialled = Arc::new(Mutex::new(Vec::new()));
+    let seen = Arc::clone(&dialled);
+    let options =
+        Options::new(bridge.url(), token(Role::Client, "dialled")).dial(move |host, port| {
+            seen.lock().unwrap().push((host.clone(), port));
+            async move { TcpStream::connect((host.as_str(), port)).await }
+        });
+    let client = Client::new(options);
+    client.expose("echo", echo());
+    client.connect().await.expect("online through the hook");
+    assert_eq!(
+        *dialled.lock().unwrap(),
+        vec![("127.0.0.1".to_owned(), bridge.port)]
+    );
+    assert_eq!(
+        call(bridge.port, "dialled", "echo", json!({ "value": 4 })).await["structuredContent"],
+        json!({ "value": 4 })
+    );
+    client.close();
+}
