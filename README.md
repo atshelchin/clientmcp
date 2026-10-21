@@ -58,6 +58,15 @@ mcp.expose("add_todo", {
 await mcp.connect();
 ```
 
+Rust applications (desktop, or a mobile app's core) use `clientmcp-client`
+(`crates/client`), with the same protocol and behaviour:
+
+```rust
+let mcp = Client::new(Options::new("ws://localhost:8080/connect", client_token));
+mcp.expose("add_todo", Tool::new(move |args, _ctx| add_todo(args)).description("Add a todo"));
+mcp.connect().await?;
+```
+
 **4. Connect an agent**, e.g. Claude Code:
 
 ```sh
@@ -142,11 +151,14 @@ tools; agents stay connected and are notified when it returns.
 cargo test --workspace --exclude clientmcp-worker   # core unit tests
 tests/run-native.sh                                  # conformance suite vs. the server
 tests/run-worker.sh                                  # conformance suite vs. the Worker in workerd
+CLIENTMCP_APP=rust tests/run-native.sh               # the same, with the Rust client as the application
 ```
 
-The conformance suite (`tests/`, 33 cases) drives a bridge with the official
+The conformance suite (`tests/`, 34 cases) drives a bridge with the official
 MCP SDKs as agents — v1 (2025 era) and v2 (2026-07-28, pinned and
-auto-negotiated) — and this repository's SDK as the application. It covers
+auto-negotiated) — and this repository's SDK as the application; with
+`CLIENTMCP_APP=rust` the Rust client plays the application instead (its
+handlers stay in the suite, the Rust client does all of the protocol). It covers
 authentication, origin checks and CORS, both MCP eras, header validation,
 `x-mcp-header`, notification streams, streamed slow calls, concurrency,
 timeouts, cancellation in both eras (checked before the call timeout could
@@ -190,6 +202,7 @@ crates/core        protocol logic shared by both runtimes, no I/O
 crates/server      the Linux/Docker bridge (tokio, hyper, tokio-tungstenite)
 crates/worker      the Cloudflare bridge (workers-rs, Durable Objects)
 sdk/js             the TypeScript SDK for applications
+crates/client      the Rust client for applications, as sdk/js
 tests              the conformance suite
 crates/bench       the load generator
 examples/browser   a shared todo list

@@ -2,6 +2,8 @@
 # Runs the Worker locally in workerd (wrangler dev) and the conformance suite against it.
 set -e
 WORKER="$(cd "$(dirname "$0")/../crates/worker" && pwd)"
+# CLIENTMCP_APP=rust: the Rust client plays the application (tests/rust-app.mjs).
+[ "$CLIENTMCP_APP" = rust ] && (cd "$WORKER/../.." && cargo build -q -p clientmcp-client --example conformance_app)
 cd "$WORKER"
 SECRET=$(openssl rand -hex 32)
 printf 'CLIENTMCP_SECRET=%s\nCLIENTMCP_CALL_TIMEOUT=5\nCLIENTMCP_ALLOWED_ORIGINS=http://allowed.test\n' "$SECRET" > .dev.vars
