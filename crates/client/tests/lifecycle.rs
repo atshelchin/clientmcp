@@ -220,11 +220,12 @@ async fn it_reconnects_when_the_bridge_comes_back() {
         call(port, "back", "echo", json!({ "value": 3 })).await["structuredContent"],
         json!({ "value": 3 })
     );
+    until("Online reported", || {
+        seen.lock().unwrap().last().map(|(s, _)| *s) == Some(Status::Online)
+    })
+    .await;
     let statuses: Vec<Status> = seen.lock().unwrap().iter().map(|(s, _)| *s).collect();
-    assert!(
-        statuses.contains(&Status::Offline) && statuses.last() == Some(&Status::Online),
-        "{statuses:?}"
-    );
+    assert!(statuses.contains(&Status::Offline), "{statuses:?}");
     client.close();
 }
 
@@ -236,10 +237,12 @@ async fn a_fixed_token_that_is_refused_closes_for_good() {
     let close = client.connect().await.expect_err("refused");
     assert_eq!(close.code, 4401);
     assert_eq!(client.status(), Status::Closed);
-    assert_eq!(
-        seen.lock().unwrap().last(),
-        Some(&(Status::Closed, Some(4401)))
-    );
+    // The callback runs outside the client's lock, so it may land just after
+    // connect() resolves.
+    until("Closed 4401 reported", || {
+        seen.lock().unwrap().last() == Some(&(Status::Closed, Some(4401)))
+    })
+    .await;
 }
 
 #[tokio::test(flavor = "multi_thread")]
