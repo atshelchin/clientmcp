@@ -287,7 +287,11 @@ impl ClientObject {
                 let roles: Vec<Role> = body
                     .get("roles")
                     .and_then(Value::as_array)
-                    .map(|list| list.iter().filter_map(|v| v.as_str().and_then(crate::internal::role)).collect())
+                    .map(|list| {
+                        list.iter()
+                            .filter_map(|v| v.as_str().and_then(crate::internal::role))
+                            .collect()
+                    })
                     .unwrap_or_default();
                 let mut out = Ok(());
                 for role in roles {
@@ -307,12 +311,14 @@ impl ClientObject {
                 };
                 let grace = body.get("grace_ms").and_then(Value::as_u64).unwrap_or(0);
                 // A new generation is a new token: what the limit counts.
-                generations.issue(issue_limit, ISSUE_WINDOW_MS, now).and_then(|_| {
-                    generations.rotate(role, grace, now)?;
-                    let c = generations.credential(role, exp)?;
-                    credentials.push((role, c));
-                    Ok(())
-                })
+                generations
+                    .issue(issue_limit, ISSUE_WINDOW_MS, now)
+                    .and_then(|_| {
+                        generations.rotate(role, grace, now)?;
+                        let c = generations.credential(role, exp)?;
+                        credentials.push((role, c));
+                        Ok(())
+                    })
             }
             "revoke" => {
                 let roles: &[Role] = match role {

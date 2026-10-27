@@ -298,11 +298,25 @@ mod tests {
     fn showing_a_credential_again_is_not_issuing_one() {
         let mut g = Generations::default();
         let first = g.credential(Role::Agent, 5_000).unwrap();
-        assert_eq!(first, Credential { generation: 0, exp: 5_000, new: true });
+        assert_eq!(
+            first,
+            Credential {
+                generation: 0,
+                exp: 5_000,
+                new: true
+            }
+        );
         for _ in 0..100 {
             // Asked again with another expiry: the same credential.
             let again = g.credential(Role::Agent, 9_999).unwrap();
-            assert_eq!(again, Credential { generation: 0, exp: 5_000, new: false });
+            assert_eq!(
+                again,
+                Credential {
+                    generation: 0,
+                    exp: 5_000,
+                    new: false
+                }
+            );
         }
         assert_eq!(g.issued.count, 0, "nothing counted");
         // The client's credential is its own.
@@ -320,7 +334,8 @@ mod tests {
     fn a_generation_stored_before_expiries_were_is_shown_without_limit() {
         // Stored by an older bridge: generations, a full window, no expiry.
         let mut g: Generations =
-            serde_json::from_str(r#"{"client":0,"agent":1,"issued":{"started_ms":0,"count":30}}"#).unwrap();
+            serde_json::from_str(r#"{"client":0,"agent":1,"issued":{"started_ms":0,"count":30}}"#)
+                .unwrap();
         assert!(g.credential(Role::Agent, 5_000).unwrap().new);
         assert_eq!(g.credential(Role::Agent, 9_000).unwrap().exp, 5_000);
     }

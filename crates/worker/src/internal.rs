@@ -112,7 +112,10 @@ pub(crate) async fn handle(
             };
             let names: Vec<String> = roles.iter().map(Role::to_string).collect();
             let answer = object
-                .fetch_with_request(ask("mint", &json!({ "roles": names, "exp": exp, "actor": actor }))?)
+                .fetch_with_request(ask(
+                    "mint",
+                    &json!({ "roles": names, "exp": exp, "actor": actor }),
+                )?)
                 .await?;
             signed(answer, config, env, id, &roles, actor, "mint").await
         }
@@ -288,9 +291,16 @@ async fn signed(
         });
         latest = latest.max(issued.exp);
         let what = if issued.new { action } else { "reveal" };
-        audit(env, id, what, &role.to_string(), Some(issued.generation), actor).await;
+        audit(
+            env,
+            id,
+            what,
+            &role.to_string(),
+            Some(issued.generation),
+            actor,
+        )
+        .await;
     }
     out["exp"] = json!(latest);
     Response::from_json(&out)
 }
-
