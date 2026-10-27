@@ -270,24 +270,49 @@ impl ClientObject {
         let now = Date::now().as_millis();
         let mut generations = self.generations().await;
         let role = body.get("role").and_then(Value::as_str).unwrap_or("");
+        let exp = body.get("exp").and_then(Value::as_u64).unwrap_or(0);
+        let issue_limit = self
+            .env
+            .var("CLIENTMCP_ISSUE_LIMIT")
+            .ok()
+            .and_then(|v| v.to_string().parse().ok())
+            .unwrap_or(ISSUE_LIMIT);
+        let mut credentials: Vec<(Role, clientmcp_core::generations::Credential)> = Vec::new();
         let outcome = match action {
             "state" => return Response::from_json(&generations),
             "usage" => return Response::from_json(&self.meter().pending().await?),
             "mint" => {
-                let limit = self
-                    .env
-                    .var("CLIENTMCP_ISSUE_LIMIT")
-                    .ok()
-                    .and_then(|v| v.to_string().parse().ok())
-                    .unwrap_or(ISSUE_LIMIT);
-                generations.issue(limit, ISSUE_WINDOW_MS, now)
+                // The current credentials: issued the first time (at `exp`),
+                // the same ones every time after (shown again). Never limited.
+                let roles: Vec<Role> = body
+                    .get("roles")
+                    .and_then(Value::as_array)
+                    .map(|list| list.iter().filter_map(|v| v.as_str().and_then(crate::internal::role)).collect())
+                    .unwrap_or_default();
+                let mut out = Ok(());
+                for role in roles {
+                    match generations.credential(role, exp) {
+                        Ok(c) => credentials.push((role, c)),
+                        Err(refusal) => {
+                            out = Err(refusal);
+                            break;
+                        }
+                    }
+                }
+                out
             }
             "rotate" => {
                 let Some(role) = crate::internal::role(role) else {
                     return Response::error("`role` is client or agent", 400);
                 };
                 let grace = body.get("grace_ms").and_then(Value::as_u64).unwrap_or(0);
-                generations.rotate(role, grace, now).map(|_| ())
+                // A new generation is a new token: what the limit counts.
+                generations.issue(issue_limit, ISSUE_WINDOW_MS, now).and_then(|_| {
+                    generations.rotate(role, grace, now)?;
+                    let c = generations.credential(role, exp)?;
+                    credentials.push((role, c));
+                    Ok(())
+                })
             }
             "revoke" => {
                 let roles: &[Role] = match role {
@@ -347,11 +372,14 @@ impl ClientObject {
                 let _ = ws.close(Some(1000), Some("token revoked or replaced"));
             }
         }
-        Response::from_json(&json!({
-            "client": generations.client,
-            "agent": generations.agent,
+        let mut answer = json!({
+            "generations": { "client": generations.client, "agent": generations.agent },
             "deleted": generations.deleted,
-        }))
+        });
+        for (role, c) in credentials {
+            answer[role.to_string()] = json!({ "gen": c.generation, "exp": c.exp, "new": c.new });
+        }
+        Response::from_json(&answer)
     }
 
     /// A client connection. The newest one wins (SPEC §3.1).

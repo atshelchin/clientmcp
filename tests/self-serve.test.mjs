@@ -136,6 +136,23 @@ describe("the internal API", () => {
   });
 });
 
+describe("the bridge's own records", () => {
+  test("usage and the audit are there for the site, and for nobody else", async () => {
+    for (const path of ["/internal/usage", "/internal/audit"]) {
+      assert.equal((await internal(path, undefined, null)).status, 404, path);
+    }
+    const id = uid();
+    await mintFor(id);
+    const audit = await internal("/internal/audit?limit=5");
+    assert.equal(audit.status, 200);
+    const mine = audit.json.filter((row) => row.client === id);
+    assert.deepEqual(mine.map((r) => [r.action, r.actor]).sort(), [["mint", "test"], ["mint", "test"]]);
+    const usage = await internal("/internal/usage?days=7");
+    assert.equal(usage.status, 200);
+    assert.ok(Array.isArray(usage.json), "finished days, as rows (none yet on a fresh bridge)");
+  });
+});
+
 describe("generations", () => {
   test("a token minted before generations keeps working", async () => {
     const id = uid();
@@ -210,11 +227,33 @@ describe("generations", () => {
     assert.equal((await mintFor(id)).status, 410);
   });
 
-  test("issuance is limited per client", async () => {
+  test("showing a credential again is the same token, and costs nothing", async () => {
     const id = uid();
-    for (let i = 0; i < ISSUE_LIMIT; i++) assert.equal((await mintFor(id)).status, 200, `mint ${i + 1}`);
-    assert.equal((await mintFor(id)).status, 429);
+    const first = (await mintFor(id)).json;
+    for (let i = 0; i < ISSUE_LIMIT + 2; i++) {
+      const again = await mintFor(id, { exp: inAYear() + 1000 + i });
+      assert.equal(again.status, 200, `shown again, ${i + 1}`);
+      assert.equal(again.json.agent.token, first.agent.token, "the very same agent token");
+      assert.equal(again.json.client.token, first.client.token, "the very same client token");
+    }
+    const audit = (await internal("/internal/audit?limit=50")).json.filter((r) => r.client === id);
+    assert.equal(audit.filter((r) => r.action === "mint").length, 2, "issued once per role");
+    assert.ok(audit.some((r) => r.action === "reveal"), "shown again, audited as such");
+  });
+
+  test("new generations are limited per client", async () => {
+    const id = uid();
+    await mintFor(id);
+    let status = 200;
+    let rotated = 0;
+    while (status === 200 && rotated <= ISSUE_LIMIT) {
+      status = (await internal(`/internal/clients/${id}/rotate`, { role: "agent", exp: inAYear(), actor: "test" })).status;
+      if (status === 200) rotated++;
+    }
+    assert.equal(status, 429, `refused after ${rotated} rotations`);
+    assert.equal(rotated, ISSUE_LIMIT);
     assert.equal((await mintFor(uid())).status, 200, "another client is not affected");
+    assert.equal((await mintFor(id)).status, 200, "the current credentials can still be shown");
   });
 });
 

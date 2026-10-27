@@ -129,9 +129,12 @@ holds it.
 
   The site states who asked (account ID, admin or the person), and the bridge
   records it.
-- The bridge limits issuance (for example, at most 30 mints per client per
-  hour) and keeps the issuance audit: what was minted or rotated, when, for
-  which client, at whose request. The site keeps the account-side audit
+- One generation is one credential: asked for again, the bridge signs the
+  same claims with the same expiry, so the same token comes back, uncounted
+  (audited as `reveal`). What the bridge limits is new generations — at most
+  30 rotations per client per hour — and it keeps the issuance audit: what
+  was minted, shown again or rotated, when, for which client, at whose
+  request. The site keeps the account-side audit
   (sign-ins, suspensions).
 
 ## Returning the token to the app
@@ -145,17 +148,26 @@ asked for it. It uses the OAuth 2.0 authorization-code flow with PKCE
 2. The site accepts only a `redirect_uri` registered for that `app`, compared
    exactly:
    - Vela iOS and Android: `app.getvela.wallet:/clientmcp` (private-use scheme);
-   - Vela web and the extension: `https://wallet.getvela.app/clientmcp` (its
-     exact origin, to be confirmed).
+   - Vela web: `https://wallet.getvela.app/clientmcp` (the extension later);
+   - Vela desktop: the loopback `http://127.0.0.1:<any port>/clientmcp`
+     (RFC 8252 §7.3), where only the port may vary.
 3. After GitHub sign-in and the person's confirm, the site redirects to
    `redirect_uri?code=…&state=…`. The code lives 2 minutes and works once.
 4. The app checks `state`, then posts the `code` and `code_verifier` to
-   `https://clientmcp.dev/api/token`. The answer: bridge URL, client token,
-   expiry, and the account login (shown in the app as "connected as @login").
+   `https://clientmcp.dev/api/token` (JSON; CORS for a registered web app's
+   origin). The answer: bridge URL, client token, expiry, the account login
+   (shown in the app as "connected as @login"), and `agent_url`.
 
 Another app that registers the same scheme can see the redirect but cannot use
-the code without the verifier. The agent token is **not** returned to the app:
-the person gives it to their agent, and the wallet never needs it.
+the code without the verifier.
+
+`agent_url` is the MCP server address for the person's AI agent, with the agent
+token in its path: the same one the account page copies. The owner decided on
+2026-10-27 that the app hands it over itself ("这样才方便"), so the person copies
+it from the wallet without visiting the site. The app keeps it with the client
+token, in its secret store. Reconnecting from the app replaces only the client token,
+so agents already set up keep working; deleting the client on the site retires
+both.
 
 Apps are registered in the site's configuration (name, icon, redirect URIs).
 Only the owner adds an app.

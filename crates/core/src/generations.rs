@@ -34,6 +34,22 @@ pub struct Generations {
     /// Mints in the current issuance window.
     #[serde(default)]
     pub issued: Window,
+    /// The expiry the current client credential was issued with: showing it
+    /// again re-signs the same claims, so it is the same token, not a new one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub client_exp: Option<u64>,
+    /// The same, for the agent credential.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent_exp: Option<u64>,
+}
+
+/// A credential to sign: its generation and expiry, and whether it was issued
+/// just now (a new credential) or is the current one shown again.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Credential {
+    pub generation: u64,
+    pub exp: u64,
+    pub new: bool,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -95,6 +111,7 @@ impl Generations {
                     return Err(Refusal::Grace);
                 }
                 self.client += 1;
+                self.client_exp = None;
                 Ok(self.client)
             }
             Role::Agent => {
@@ -106,6 +123,7 @@ impl Generations {
                     until_ms: now_ms.saturating_add(grace_ms),
                 });
                 self.agent += 1;
+                self.agent_exp = None;
                 Ok(self.agent)
             }
         }
@@ -125,16 +143,52 @@ impl Generations {
             Role::Agent => &mut self.agent,
         };
         *generation += REVOKE_STEP;
-        Ok(*generation)
+        let next = *generation;
+        *self.exp_of(role) = None;
+        Ok(next)
     }
 
     /// The client is gone: no token of either role is accepted again.
     pub fn delete(&mut self) {
         self.deleted = true;
         self.agent_grace = None;
+        self.client_exp = None;
+        self.agent_exp = None;
     }
 
-    /// Counts a mint against `limit` per `window_ms`; refused past it.
+    fn exp_of(&mut self, role: Role) -> &mut Option<u64> {
+        match role {
+            Role::Client => &mut self.client_exp,
+            Role::Agent => &mut self.agent_exp,
+        }
+    }
+
+    /// `role`'s current credential: the first time it is asked for at its
+    /// generation, with `exp`; every time after, the same one again (the same
+    /// expiry, so the same token). Never limited: one generation is one
+    /// credential however often it is shown. What the limit counts is new
+    /// generations ([`Generations::rotate`]).
+    pub fn credential(&mut self, role: Role, exp: u64) -> Result<Credential, Refusal> {
+        if self.deleted {
+            return Err(Refusal::Deleted);
+        }
+        let generation = self.current(role);
+        if let Some(issued) = *self.exp_of(role) {
+            return Ok(Credential {
+                generation,
+                exp: issued,
+                new: false,
+            });
+        }
+        *self.exp_of(role) = Some(exp);
+        Ok(Credential {
+            generation,
+            exp,
+            new: true,
+        })
+    }
+
+    /// Counts a new generation against `limit` per `window_ms`; refused past it.
     pub fn issue(&mut self, limit: u32, window_ms: u64, now_ms: u64) -> Result<(), Refusal> {
         if self.deleted {
             return Err(Refusal::Deleted);
@@ -238,6 +292,37 @@ mod tests {
         assert!(!g.accepts(Role::Agent, 0, 1), "not even within a grace");
         assert_eq!(g.rotate(Role::Agent, 0, 0), Err(Refusal::Deleted));
         assert_eq!(g.issue(30, HOUR, 0), Err(Refusal::Deleted));
+    }
+
+    #[test]
+    fn showing_a_credential_again_is_not_issuing_one() {
+        let mut g = Generations::default();
+        let first = g.credential(Role::Agent, 5_000).unwrap();
+        assert_eq!(first, Credential { generation: 0, exp: 5_000, new: true });
+        for _ in 0..100 {
+            // Asked again with another expiry: the same credential.
+            let again = g.credential(Role::Agent, 9_999).unwrap();
+            assert_eq!(again, Credential { generation: 0, exp: 5_000, new: false });
+        }
+        assert_eq!(g.issued.count, 0, "nothing counted");
+        // The client's credential is its own.
+        assert!(g.credential(Role::Client, 6_000).unwrap().new);
+        // A new generation is a new credential.
+        g.revoke(Role::Agent).unwrap();
+        let next = g.credential(Role::Agent, 7_000).unwrap();
+        assert_eq!(next.exp, 7_000);
+        assert!(next.new);
+        g.delete();
+        assert_eq!(g.credential(Role::Client, 1), Err(Refusal::Deleted));
+    }
+
+    #[test]
+    fn a_generation_stored_before_expiries_were_is_shown_without_limit() {
+        // Stored by an older bridge: generations, a full window, no expiry.
+        let mut g: Generations =
+            serde_json::from_str(r#"{"client":0,"agent":1,"issued":{"started_ms":0,"count":30}}"#).unwrap();
+        assert!(g.credential(Role::Agent, 5_000).unwrap().new);
+        assert_eq!(g.credential(Role::Agent, 9_000).unwrap().exp, 5_000);
     }
 
     #[test]

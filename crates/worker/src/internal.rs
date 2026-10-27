@@ -16,6 +16,8 @@
 //!   actor}` → a token at the role's next generation
 //! - `POST   /internal/clients/<id>/revoke`   `{role: client|agent|both, actor}`
 //! - `POST   /internal/clients/<id>/delete`   `{actor}`
+//! - `GET    /internal/usage?days=30`         finished days' usage, per client
+//! - `GET    /internal/audit?limit=100`       the latest issuance audit rows
 //!
 //! The generations live in the client's object; this module signs.
 
@@ -33,11 +35,14 @@ const SERVICE_HEADER: &str = "x-clientmcp-service";
 /// The longest validity a minted token may have: a little over a year.
 const MAX_EXP_SECONDS: u64 = 400 * 24 * 60 * 60;
 
-/// The object's answer to a mint or a rotation: the generations to sign at.
+/// One credential as the object hands it out: what to sign.
 #[derive(Deserialize, Serialize)]
-pub(crate) struct Minting {
-    pub client: u64,
-    pub agent: u64,
+pub(crate) struct Issued {
+    #[serde(rename = "gen")]
+    pub generation: u64,
+    pub exp: u64,
+    /// Issued just now, or the current credential shown again.
+    pub new: bool,
 }
 
 pub(crate) async fn handle(
@@ -48,6 +53,12 @@ pub(crate) async fn handle(
 ) -> Result<Response> {
     if !authorized(&req, env) {
         return Response::error("not found", 404);
+    }
+    // The bridge's own records, for the site's admin page.
+    match req.path().as_str() {
+        "/internal/usage" => return usage_days(&req, env).await,
+        "/internal/audit" => return audit_log(&req, env).await,
+        _ => {}
     }
     let path = req.path();
     let mut parts = path.trim_start_matches("/internal/clients/").splitn(2, '/');
@@ -99,24 +110,11 @@ pub(crate) async fn handle(
                 Some(roles) => roles,
                 None => return Response::error("`roles` is client and/or agent", 400),
             };
-            let mut answer = object
-                .fetch_with_request(ask("mint", &json!({ "actor": actor }))?)
+            let names: Vec<String> = roles.iter().map(Role::to_string).collect();
+            let answer = object
+                .fetch_with_request(ask("mint", &json!({ "roles": names, "exp": exp, "actor": actor }))?)
                 .await?;
-            if answer.status_code() != 200 {
-                return Ok(answer);
-            }
-            let at: Minting = answer.json().await?;
-            let mut out = json!({ "exp": exp });
-            for role in roles {
-                let generation = match role {
-                    Role::Client => at.client,
-                    Role::Agent => at.agent,
-                };
-                out[role.to_string()] =
-                    json!({ "token": sign(config, id, role, generation, exp), "gen": generation });
-                audit(env, id, "mint", &role.to_string(), Some(generation), actor).await;
-            }
-            Response::from_json(&out)
+            signed(answer, config, env, id, &roles, actor, "mint").await
         }
         (Method::Post, Some("rotate")) => {
             let Some(exp) = exp else {
@@ -129,33 +127,13 @@ pub(crate) async fn handle(
                 .get("grace_seconds")
                 .and_then(Value::as_u64)
                 .unwrap_or(0);
-            let mut answer = object
+            let answer = object
                 .fetch_with_request(ask(
                     "rotate",
-                    &json!({ "role": role.to_string(), "grace_ms": grace.saturating_mul(1000), "actor": actor }),
+                    &json!({ "role": role.to_string(), "grace_ms": grace.saturating_mul(1000), "exp": exp, "actor": actor }),
                 )?)
                 .await?;
-            if answer.status_code() != 200 {
-                return Ok(answer);
-            }
-            let at: Minting = answer.json().await?;
-            let generation = match role {
-                Role::Client => at.client,
-                Role::Agent => at.agent,
-            };
-            audit(
-                env,
-                id,
-                "rotate",
-                &role.to_string(),
-                Some(generation),
-                actor,
-            )
-            .await;
-            Response::from_json(&json!({
-                "exp": exp,
-                role.to_string(): { "token": sign(config, id, role, generation, exp), "gen": generation },
-            }))
+            signed(answer, config, env, id, &[role], actor, "rotate").await
         }
         (Method::Post, Some("revoke")) => {
             let which = body.get("role").and_then(Value::as_str).unwrap_or("");
@@ -235,3 +213,84 @@ fn roles(value: Option<&Value>) -> Option<Vec<Role>> {
     let roles: Option<Vec<Role>> = list.iter().map(|v| v.as_str().and_then(role)).collect();
     roles.filter(|r| !r.is_empty())
 }
+
+/// A query parameter as a number within `1..=max`, else `default`.
+fn bounded(req: &Request, name: &str, default: u32, max: u32) -> u32 {
+    req.url()
+        .ok()
+        .and_then(|url| {
+            url.query_pairs()
+                .find(|(k, _)| k == name)
+                .and_then(|(_, v)| v.parse::<u32>().ok())
+        })
+        .filter(|n| (1..=max).contains(n))
+        .unwrap_or(default)
+}
+
+/// Finished days' exact usage per client (metering.rs writes them after
+/// midnight), newest first. Today's are in each client's object (`…/usage`).
+async fn usage_days(req: &Request, env: &Env) -> Result<Response> {
+    let days = bounded(req, "days", 30, 400);
+    let since = clientmcp_core::usage::day_of(
+        (js_sys::Date::now() as u64).saturating_sub(u64::from(days) * 24 * 60 * 60 * 1000),
+    );
+    let db = env.d1("BRIDGE_DB")?;
+    let rows = db
+        .prepare("SELECT * FROM usage_daily WHERE day >= ?1 ORDER BY day DESC, client LIMIT 10000")
+        .bind(&[since.into()])?
+        .all()
+        .await?
+        .results::<Value>()?;
+    Response::from_json(&rows)
+}
+
+/// The latest issuance audit rows, newest first.
+async fn audit_log(req: &Request, env: &Env) -> Result<Response> {
+    let limit = bounded(req, "limit", 100, 1000);
+    let db = env.d1("BRIDGE_DB")?;
+    let rows = db
+        .prepare("SELECT at, client, action, role, gen, actor FROM issuance_audit ORDER BY at DESC LIMIT ?1")
+        .bind(&[f64::from(limit).into()])?
+        .all()
+        .await?
+        .results::<Value>()?;
+    Response::from_json(&rows)
+}
+
+/// The object's credentials, signed. A new one is audited as `action`; one
+/// shown again as `reveal` — the same credential, not a new one.
+async fn signed(
+    mut answer: Response,
+    config: &Config,
+    env: &Env,
+    id: &str,
+    roles: &[Role],
+    actor: &str,
+    action: &str,
+) -> Result<Response> {
+    if answer.status_code() != 200 {
+        return Ok(answer);
+    }
+    let body: Value = answer.json().await?;
+    let mut out = json!({});
+    let mut latest = 0;
+    for role in roles {
+        let Some(issued) = body
+            .get(role.to_string())
+            .and_then(|v| serde_json::from_value::<Issued>(v.clone()).ok())
+        else {
+            return Response::error("the client object did not issue a credential", 500);
+        };
+        out[role.to_string()] = json!({
+            "token": sign(config, id, *role, issued.generation, issued.exp),
+            "gen": issued.generation,
+            "exp": issued.exp,
+        });
+        latest = latest.max(issued.exp);
+        let what = if issued.new { action } else { "reveal" };
+        audit(env, id, what, &role.to_string(), Some(issued.generation), actor).await;
+    }
+    out["exp"] = json!(latest);
+    Response::from_json(&out)
+}
+
