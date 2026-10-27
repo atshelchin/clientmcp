@@ -19,7 +19,13 @@ set -m
 npx wrangler dev -c "$CONFIG" --persist-to "$STATE" --ip 127.0.0.1 --port "$PORT" > /dev/null 2>&1 & WRANGLER=$!
 set +m
 trap 'kill -- -$WRANGLER 2>/dev/null; rm -f "$WORKER/.dev.vars"; rm -rf "$STATE"' EXIT
-until curl --noproxy '*' -sf "http://127.0.0.1:$PORT/health" > /dev/null; do sleep 1; done
+# At most two minutes: a dev server that never comes up fails the run instead of hanging it.
+TRIES=0
+until curl --noproxy '*' -sf "http://127.0.0.1:$PORT/health" > /dev/null; do
+  TRIES=$((TRIES + 1))
+  [ "$TRIES" -lt 120 ] || { echo "wrangler dev did not come up" >&2; exit 1; }
+  sleep 1
+done
 cd ../../tests
 BRIDGE_URL=http://127.0.0.1:$PORT CLIENTMCP_SECRET=$SECRET CLIENTMCP_SERVICE_SECRET=$SERVICE \
   CLIENTMCP_ISSUE_LIMIT=$LIMIT CLIENTMCP_RATE_LIMIT=5 CLIENTMCP_CALL_TIMEOUT=5 \

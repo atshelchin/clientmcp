@@ -80,6 +80,11 @@ pub struct ClientObject {
     env: Env,
     current: RefCell<Option<Current>>,
     loaded: Cell<bool>,
+    /// The stored generations, kept in memory: this object is their only
+    /// writer, so after the first read no request waits on storage for them.
+    generations: RefCell<Option<Generations>>,
+    /// The client's ID once named this instance (metering).
+    named: RefCell<Option<String>>,
     /// Keys cancelled before their call arrived, and when: the Worker's
     /// cancel for an agent that hung up can overtake the call it forwarded.
     cancelled_early: RefCell<VecDeque<(String, u64)>>,
@@ -123,6 +128,8 @@ impl DurableObject for ClientObject {
             env,
             current: RefCell::new(None),
             loaded: Cell::new(false),
+            generations: RefCell::new(None),
+            named: RefCell::new(None),
             cancelled_early: RefCell::new(VecDeque::new()),
         }
     }
@@ -229,17 +236,24 @@ impl ClientObject {
         Meter {
             state: &self.state,
             env: &self.env,
+            named: &self.named,
         }
     }
 
     async fn generations(&self) -> Generations {
-        self.state
+        if let Some(known) = self.generations.borrow().clone() {
+            return known;
+        }
+        let stored: Generations = self
+            .state
             .storage()
             .get(GENERATIONS)
             .await
             .ok()
             .flatten()
-            .unwrap_or_default()
+            .unwrap_or_default();
+        *self.generations.borrow_mut() = Some(stored.clone());
+        stored
     }
 
     /// Whether a `role` token at `generation` is still this client's.
@@ -305,6 +319,7 @@ impl ClientObject {
             return Response::error(reason, status);
         }
         self.state.storage().put(GENERATIONS, &generations).await?;
+        *self.generations.borrow_mut() = Some(generations.clone());
         // What no longer holds goes now, not at its next connect.
         let ended_client = match action {
             "rotate" => role == "client",

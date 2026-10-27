@@ -24,6 +24,8 @@ const AFTER_MIDNIGHT_MS: u64 = 60_000;
 pub(crate) struct Meter<'a> {
     pub state: &'a State,
     pub env: &'a Env,
+    /// The client's ID as this instance knows it: storage is touched once.
+    pub named: &'a std::cell::RefCell<Option<String>>,
 }
 
 impl Meter<'_> {
@@ -34,19 +36,22 @@ impl Meter<'_> {
     /// Remembers the client's ID the Worker passed along.
     pub async fn name(&self, id: Option<String>) {
         let Some(id) = id else { return };
+        if self.named.borrow().as_deref() == Some(id.as_str()) {
+            return;
+        }
         let known: Option<String> = self.storage().get(CLIENT_ID).await.ok().flatten();
         if known.as_deref() != Some(id.as_str()) {
             let _ = self.storage().put(CLIENT_ID, &id).await;
         }
+        *self.named.borrow_mut() = Some(id);
     }
 
     async fn client(&self) -> String {
-        self.storage()
-            .get(CLIENT_ID)
-            .await
-            .ok()
-            .flatten()
-            .unwrap_or_default()
+        if let Some(id) = self.named.borrow().clone() {
+            return id;
+        }
+        let stored: Option<String> = self.storage().get(CLIENT_ID).await.ok().flatten();
+        stored.unwrap_or_default()
     }
 
     /// Applies `f` to `day`'s counts and keeps them, with an alarm to write
