@@ -110,6 +110,7 @@ by the Worker, so a connected but idle application does not keep anything awake.
 | --------------------------- | ---------------- | ----------------------------------------------------------------------- |
 | `CLIENTMCP_SECRET`          | — (required)     | Token secrets, ≥ 32 bytes, newest first, space-separated for rotation.  |
 | `CLIENTMCP_CALL_TIMEOUT`    | `120`            | Seconds before an unanswered call fails and is cancelled.               |
+| `CLIENTMCP_CLIENT_IDLE`     | `90`             | Seconds an application may send nothing (pings included) before it is presumed gone and closed; its calls fail then, not at the call timeout. |
 | `CLIENTMCP_ALLOWED_ORIGINS` | none             | Browser origins allowed on `/mcp` (comma-separated, or `*`).            |
 | `CLIENTMCP_LISTEN`          | `127.0.0.1:8080` | Listen address (server only; the image uses `0.0.0.0:8080`).            |
 
@@ -166,6 +167,10 @@ cancel instead), disconnection, replacement, size limits and tool validation. It
 passes unchanged against the native server, the Docker image, the Worker
 running in workerd and the deployed Worker (`bridge.clientmcp.dev`, where the
 call-timeout case is skipped: it needs `CLIENTMCP_CALL_TIMEOUT` of 5 or less).
+`tests/run-idle.sh` runs `idle.test.mjs` against the native server and the
+Worker in workerd with a 3-second client idle: a call to an application that
+went silent fails at the idle limit, its tools stop being offered, and one that
+keeps pinging is kept.
 Beyond the suite: the browser example was exercised end to end in Chrome —
 agent changes appeared in the UI, user edits were visible to the agent, a
 declined confirmation reached the agent as a tool error, and the page

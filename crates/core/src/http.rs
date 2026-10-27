@@ -301,6 +301,7 @@ mod tests {
         Config {
             keys: Keys::parse("0123456789abcdef0123456789abcdef").unwrap(),
             call_timeout: Duration::from_secs(1),
+            client_idle: Duration::from_secs(90),
             origins: Origins::parse("https://app.example, https://b.example/"),
         }
     }

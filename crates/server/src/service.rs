@@ -76,7 +76,9 @@ impl Bridge {
             };
             let socket = client::accept(upgraded).await;
             match client {
-                Some(id) => client::serve(self.hub.clone(), id, socket).await,
+                Some(id) => {
+                    client::serve(self.hub.clone(), id, socket, self.config.client_idle).await;
+                }
                 None => client::refuse(socket).await,
             }
         });

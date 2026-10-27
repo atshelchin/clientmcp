@@ -420,7 +420,11 @@ document its limits. The reference bridge uses:
 - *Cloudflare Workers.* One Durable Object per client ID holds the client
   WebSocket through the Hibernation API, so an idle client costs nothing. The
   exact-text ping is answered by `setWebSocketAutoResponse` without waking the
-  object. Notification streams are held by the stateless Worker, which listens
+  object. Since those pings never reach the object, it reads when a client was
+  last heard from as the later of its last message and the platform's record
+  of the last auto-response (`getWebSocketAutoResponseTimestamp`), and closes
+  a client silent for the idle limit — on any agent request, and every few
+  seconds while a call waits — as a bridge that sees the pings does. Notification streams are held by the stateless Worker, which listens
   to the Durable Object over an internal hibernatable WebSocket, so an agent
   waiting for changes does not keep the object awake either. The tool set is
   kept in Durable Object storage only so that it survives hibernation; it is

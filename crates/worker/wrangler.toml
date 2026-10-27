@@ -20,6 +20,8 @@ new_sqlite_classes = ["ClientObject"]
 [vars]
 # Tool call timeout in seconds.
 CLIENTMCP_CALL_TIMEOUT = "120"
+# A client that sends nothing for this long is presumed gone (SPEC §3.2).
+CLIENTMCP_CLIENT_IDLE = "90"
 # Browser origins allowed on /mcp: comma-separated, or "*". Empty allows none.
 CLIENTMCP_ALLOWED_ORIGINS = ""
 

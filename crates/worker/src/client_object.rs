@@ -5,9 +5,17 @@
 //! keeps the WebSocket, so the last accepted `register` is also stored, and the
 //! session is rebuilt from it on the next event. Calls in flight keep the
 //! object awake, so they are never lost to hibernation.
+//!
+//! A client that sends nothing for `CLIENTMCP_CLIENT_IDLE` is presumed gone and
+//! closed (SPEC §3.2), as the native bridge does. Its pings are answered at the
+//! edge and never reach the object, so what it last sent is read from the
+//! platform's own record of the last auto-response, beside the last message
+//! the object saw. A phone that lost its network fails its calls at once
+//! rather than holding them until the call timeout.
 
 use std::cell::{Cell, RefCell};
 use std::collections::VecDeque;
+use std::time::Duration;
 
 use clientmcp_core::MAX_LISTENERS;
 use clientmcp_core::agent::{self, Op};
@@ -15,7 +23,23 @@ use clientmcp_core::http::Response as CoreResponse;
 use clientmcp_core::session::{self, Event, Link, Outbox, Session};
 use clientmcp_core::tools::ToolSet;
 use clientmcp_core::wire::{CLOSE_PROTOCOL, CLOSE_REPLACED, PING, PONG};
+use worker::wasm_bindgen::prelude::*;
 use worker::*;
+
+#[wasm_bindgen]
+extern "C" {
+    /// The `DurableObjectState` worker-rs wraps, for the one method it does
+    /// not bind.
+    type RawState;
+
+    /// `getWebSocketAutoResponseTimestamp(ws)`: when the edge last answered
+    /// this socket's ping, or `null`.
+    #[wasm_bindgen(method, catch, js_name = getWebSocketAutoResponseTimestamp)]
+    fn auto_response_timestamp(
+        this: &RawState,
+        ws: &web_sys::WebSocket,
+    ) -> std::result::Result<Option<js_sys::Date>, JsValue>;
+}
 
 use crate::{CANCEL_KEY, aborted, config, convert, core_headers, either_or, websocket_response};
 
@@ -32,6 +56,9 @@ const OPEN: u16 = 1;
 /// (ms): an overtaken call arrives within moments.
 const EARLY_CANCELS: usize = 64;
 const EARLY_CANCEL_MS: u64 = 10_000;
+/// How often a waiting call looks whether its client went silent: often
+/// enough that a dead client fails its call within moments of `client_idle`.
+const IDLE_POLL: Duration = Duration::from_secs(2);
 
 #[durable_object]
 pub struct ClientObject {
@@ -49,6 +76,10 @@ struct Current {
     /// Identifies the connection's WebSocket across hibernation (its attachment).
     serial: String,
     session: Session<Socket>,
+    /// When the object last heard from it (epoch ms): its accept, or a
+    /// message. Unknown (0) after hibernation, where the edge's own record
+    /// of its pings answers instead.
+    heard_at: Cell<u64>,
 }
 
 pub struct Socket(WebSocket);
@@ -115,7 +146,10 @@ impl DurableObject for ClientObject {
         self.load().await;
         let serial = serial(&ws);
         let event = match self.current.borrow_mut().as_mut() {
-            Some(current) if current.serial == serial => current.session.on_message(&text),
+            Some(current) if current.serial == serial => {
+                current.heard_at.set(Date::now().as_millis());
+                current.session.on_message(&text)
+            }
             _ => return Ok(()), // a replaced connection
         };
         match event {
@@ -157,6 +191,7 @@ impl ClientObject {
         let previous = self.current.replace(Some(Current {
             serial: serial.clone(),
             session,
+            heard_at: Cell::new(Date::now().as_millis()),
         }));
         for ws in self.state.get_websockets_with_tag(CLIENT) {
             if self::serial(&ws) != serial {
@@ -187,6 +222,10 @@ impl ClientObject {
         let headers = core_headers(&req);
         let body = req.bytes().await?;
         self.load().await;
+        let idle = config(&self.env).map_err(Error::RustError)?.client_idle;
+        // A client gone silent is gone: its tools are not offered, and a call
+        // to it is told it is offline at once.
+        self.close_if_silent(idle).await?;
         let response = match agent::parse(&method, &headers, &body) {
             Op::Reply(response) => response,
             Op::Describe(describe) => {
@@ -212,14 +251,21 @@ impl ClientObject {
                     Delay::from(config(&self.env).map_err(Error::RustError)?.call_timeout);
                 // The Worker's request is aborted when its agent hangs up and
                 // Cloudflare ends the Worker's invocation. Dropping the call
-                // then cancels it (`session::call`'s guard).
-                match either_or(session::call(self, &call, timeout), aborted(&req)).await {
+                // then cancels it (`session::call`'s guard). A client that
+                // goes silent while the call waits is closed, and the call
+                // told so.
+                let gone = either_or(aborted(&req), self.silent(idle));
+                match either_or(session::call(self, &call, timeout), gone).await {
                     Ok(outcome) => call.respond(outcome),
-                    Err(()) => {
+                    Err(Ok(())) => {
                         console_log!(
                             "clientmcp: the Worker's request went away; its call is cancelled"
                         );
                         call.respond(agent::Outcome::Cancelled)
+                    }
+                    Err(Err(())) => {
+                        self.close_if_silent(idle).await?;
+                        call.respond(agent::Outcome::Disconnected)
                     }
                 }
             }
@@ -256,7 +302,11 @@ impl ClientObject {
                     }
                     None => Session::new(Socket(ws)),
                 };
-                Some(Current { serial, session })
+                Some(Current {
+                    serial,
+                    session,
+                    heard_at: Cell::new(0),
+                })
             }
             None => None,
         };
@@ -313,6 +363,63 @@ impl ClientObject {
         early.retain(|(_, at)| now.saturating_sub(*at) < EARLY_CANCEL_MS);
         let found = early.iter().position(|(k, _)| k == key);
         found.map(|i| early.remove(i)).is_some()
+    }
+
+    /// The current client's socket and when it was last heard from (epoch
+    /// ms): the later of its last message and the edge's last answer to its
+    /// ping. `None` with no client, or none known.
+    fn last_heard(&self) -> Option<(WebSocket, u64)> {
+        let (serial, heard_at) = self
+            .current
+            .borrow()
+            .as_ref()
+            .map(|c| (c.serial.clone(), c.heard_at.get()))?;
+        let ws = self
+            .state
+            .get_websockets_with_tag(CLIENT)
+            .into_iter()
+            .find(|ws| self::serial(ws) == serial)?;
+        let pinged = self
+            .state
+            .as_raw()
+            .unchecked_ref::<RawState>()
+            .auto_response_timestamp(ws.as_ref())
+            .ok()
+            .flatten()
+            .map_or(0, |date| date.get_time() as u64);
+        let last = heard_at.max(pinged);
+        (last > 0).then_some((ws, last))
+    }
+
+    /// Whether the current client has sent nothing for `idle`.
+    fn is_silent(&self, idle: Duration) -> bool {
+        self.last_heard().is_some_and(|(_, last)| {
+            Date::now().as_millis().saturating_sub(last) > idle.as_millis() as u64
+        })
+    }
+
+    /// Resolves once the current client has gone silent for `idle`.
+    async fn silent(&self, idle: Duration) {
+        while !self.is_silent(idle) {
+            Delay::from(IDLE_POLL).await;
+        }
+    }
+
+    /// Closes the current client if it has sent nothing for `idle`, as the
+    /// native bridge does (SPEC §3.2): its session ends, failing its calls.
+    async fn close_if_silent(&self, idle: Duration) -> Result<()> {
+        if !self.is_silent(idle) {
+            return Ok(());
+        }
+        if let Some((ws, last)) = self.last_heard() {
+            console_log!(
+                "clientmcp: a client silent for {} ms is presumed gone",
+                Date::now().as_millis().saturating_sub(last)
+            );
+            let _ = ws.close(Some(1000), Some("idle"));
+            self.ended(&ws).await?;
+        }
+        Ok(())
     }
 
     fn announce(&self) {
