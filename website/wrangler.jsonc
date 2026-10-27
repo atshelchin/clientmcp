@@ -20,7 +20,7 @@
 			"binding": "SITE_DB",
 			"database_name": "clientmcp-site",
 			// Created at the site's first production deploy with these.
-			"database_id": "00000000-0000-0000-0000-000000000000",
+			"database_id": "ef4cd8d0-36e1-46af-97bc-8200d13d3364",
 			"migrations_dir": "migrations"
 		}
 	],
