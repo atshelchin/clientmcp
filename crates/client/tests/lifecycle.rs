@@ -96,6 +96,7 @@ fn token(role: Role, id: &str) -> String {
         role,
         exp: None,
         nbf: None,
+        generation: None,
     })
 }
 

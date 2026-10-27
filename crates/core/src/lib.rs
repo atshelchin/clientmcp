@@ -7,11 +7,13 @@
 //! Durable Object per client on Cloudflare.
 
 pub mod agent;
+pub mod generations;
 pub mod http;
 mod json;
 pub mod session;
 pub mod token;
 pub mod tools;
+pub mod usage;
 pub mod wire;
 
 use std::time::Duration;

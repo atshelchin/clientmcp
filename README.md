@@ -104,6 +104,24 @@ One Durable Object per client ID holds its WebSocket through the Hibernation
 API; pings are answered at the edge and agents' notification streams are held
 by the Worker, so a connected but idle application does not keep anything awake.
 
+The Worker can also issue and revoke tokens itself, meter use per client and
+hold back blatant abuse: the self-serve tokens of
+[docs/self-serve.md](docs/self-serve.md). All of it is optional. Without the
+bindings and the service secret below, the Worker behaves as before. To turn it
+on, create the database once and apply its migrations:
+
+```sh
+npx wrangler d1 create clientmcp-bridge     # put its ID in wrangler.toml
+npx wrangler d1 migrations apply BRIDGE_DB --remote
+npx wrangler secret put CLIENTMCP_SERVICE_SECRET
+```
+
+| Binding       | What it is for                                                           |
+| ------------- | ------------------------------------------------------------------------ |
+| `BRIDGE_DB`   | D1: exact daily usage per client, and the issuance audit.                |
+| `SIGNALS`     | Analytics Engine: one data point per call, connection or refusal, for live views and alerts (sampled by the platform; nothing depends on it being complete). |
+| `AGENT_LIMIT` | Rate limiting: calls per client per minute, answered as a tool error past the limit. |
+
 ### Configuration
 
 | Variable                    | Default          | Meaning                                                                 |
@@ -113,6 +131,8 @@ by the Worker, so a connected but idle application does not keep anything awake.
 | `CLIENTMCP_CLIENT_IDLE`     | `90`             | Seconds an application may send nothing (pings included) before it is presumed gone and closed; its calls fail then, not at the call timeout. |
 | `CLIENTMCP_ALLOWED_ORIGINS` | none             | Browser origins allowed on `/mcp` (comma-separated, or `*`).            |
 | `CLIENTMCP_LISTEN`          | `127.0.0.1:8080` | Listen address (server only; the image uses `0.0.0.0:8080`).            |
+| `CLIENTMCP_SERVICE_SECRET`  | none             | Worker only: ≥ 32 bytes; opens the internal issuance API (`/internal/`) to a caller presenting it, such as the site over a Service Binding. Absent, that API answers `404`. |
+| `CLIENTMCP_ISSUE_LIMIT`     | `30`             | Worker only: tokens the internal API may mint per client per hour.     |
 
 Endpoints: `/connect` (applications), `/mcp` and `/mcp/<token>` (agents), `/health`.
 
@@ -129,6 +149,11 @@ library:
 `my-app`. In production, have your backend issue short-lived client tokens
 (the SDK accepts a token function, called on every reconnection) and give
 agents tokens with an `exp`. See [SPEC.md §2](SPEC.md#2-tokens) and §7.
+
+A token may also carry `gen`, its generation. The Worker keeps each client's
+current generation per role and refuses older tokens, so one client's tokens
+can be revoked without rotating the secret (SPEC §2). A token without `gen` is
+generation 0: tokens minted before generations keep working.
 
 ## Protocol
 
@@ -152,6 +177,7 @@ tools; agents stay connected and are notified when it returns.
 cargo test --workspace --exclude clientmcp-worker   # core unit tests
 tests/run-native.sh                                  # conformance suite vs. the server
 tests/run-worker.sh                                  # conformance suite vs. the Worker in workerd
+tests/run-self-serve.sh                              # generations, issuance, metering, rate limit (Worker)
 CLIENTMCP_APP=rust tests/run-native.sh               # the same, with the Rust client as the application
 ```
 

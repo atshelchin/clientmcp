@@ -19,10 +19,14 @@ use std::time::Duration;
 
 use clientmcp_core::MAX_LISTENERS;
 use clientmcp_core::agent::{self, Op};
-use clientmcp_core::http::Response as CoreResponse;
+use clientmcp_core::generations::{Generations, Refusal};
+use clientmcp_core::http::{self as core_http, Response as CoreResponse};
 use clientmcp_core::session::{self, Event, Link, Outbox, Session};
+use clientmcp_core::token::Role;
 use clientmcp_core::tools::ToolSet;
+use clientmcp_core::wire::CLOSE_UNAUTHORIZED;
 use clientmcp_core::wire::{CLOSE_PROTOCOL, CLOSE_REPLACED, PING, PONG};
+use serde_json::{Value, json};
 use worker::wasm_bindgen::prelude::*;
 use worker::*;
 
@@ -41,10 +45,20 @@ extern "C" {
     ) -> std::result::Result<Option<js_sys::Date>, JsValue>;
 }
 
-use crate::{CANCEL_KEY, aborted, config, convert, core_headers, either_or, websocket_response};
+use crate::metering::Meter;
+use crate::{
+    CANCEL_KEY, CLIENT_ID, GENERATION, aborted, config, convert, core_headers, either_or,
+    refuse_client, websocket_response,
+};
+use clientmcp_core::usage::Ended;
 
 /// Storage key of the last accepted `register` message.
 const REGISTER: &str = "register";
+/// Storage key of the client's token generations (`docs/self-serve.md`).
+const GENERATIONS: &str = "generations";
+/// Mints per client per hour, unless `CLIENTMCP_ISSUE_LIMIT` says otherwise.
+const ISSUE_LIMIT: u32 = 30;
+const ISSUE_WINDOW_MS: u64 = 60 * 60 * 1000;
 /// WebSocket tags.
 const CLIENT: &str = "client";
 const LISTENER: &str = "listen";
@@ -114,9 +128,31 @@ impl DurableObject for ClientObject {
     }
 
     async fn fetch(&self, req: Request) -> Result<Response> {
-        match req.path().as_str() {
-            "/connect" => self.accept_client().await,
-            "/listen" => self.listen(),
+        let path = req.path();
+        self.meter()
+            .name(req.headers().get(CLIENT_ID).ok().flatten())
+            .await;
+        if let Some(action) = path.strip_prefix("/internal/") {
+            return self.internal(action, req).await;
+        }
+        // The Worker verified the token; whether its generation is still the
+        // client's is this object's to say.
+        let generation = presented_generation(&req);
+        match path.as_str() {
+            "/connect" => {
+                if !self.accepts(Role::Client, generation).await {
+                    self.meter().rejected("client").await;
+                    return refuse_client("token revoked or replaced");
+                }
+                self.accept_client().await
+            }
+            "/listen" => {
+                if !self.accepts(Role::Agent, generation).await {
+                    self.meter().rejected("agent").await;
+                    return convert(core_http::unauthorized_agent(None));
+                }
+                self.listen()
+            }
             "/cancel" => {
                 if let Some(key) = req.headers().get(CANCEL_KEY)? {
                     self.load().await;
@@ -124,7 +160,13 @@ impl DurableObject for ClientObject {
                 }
                 Response::empty()
             }
-            _ => self.agent(req).await,
+            _ => {
+                if !self.accepts(Role::Agent, generation).await {
+                    self.meter().rejected("agent").await;
+                    return convert(core_http::unauthorized_agent(None));
+                }
+                self.agent(req).await
+            }
         }
     }
 
@@ -167,6 +209,12 @@ impl DurableObject for ClientObject {
         Ok(())
     }
 
+    /// Once a day after midnight: finished days are written out (metering).
+    async fn alarm(&self) -> Result<Response> {
+        self.meter().alarm().await?;
+        Response::empty()
+    }
+
     async fn websocket_close(&self, ws: WebSocket, _: usize, _: String, _: bool) -> Result<()> {
         self.ended(&ws).await
     }
@@ -177,6 +225,120 @@ impl DurableObject for ClientObject {
 }
 
 impl ClientObject {
+    fn meter(&self) -> Meter<'_> {
+        Meter {
+            state: &self.state,
+            env: &self.env,
+        }
+    }
+
+    async fn generations(&self) -> Generations {
+        self.state
+            .storage()
+            .get(GENERATIONS)
+            .await
+            .ok()
+            .flatten()
+            .unwrap_or_default()
+    }
+
+    /// Whether a `role` token at `generation` is still this client's.
+    async fn accepts(&self, role: Role, generation: u64) -> bool {
+        self.generations()
+            .await
+            .accepts(role, generation, Date::now().as_millis())
+    }
+
+    /// The internal API's side in the object (`internal.rs` signs): the
+    /// generations, and the connections a revocation ends.
+    async fn internal(&self, action: &str, mut req: Request) -> Result<Response> {
+        let body: Value = req.json().await.unwrap_or(Value::Null);
+        let now = Date::now().as_millis();
+        let mut generations = self.generations().await;
+        let role = body.get("role").and_then(Value::as_str).unwrap_or("");
+        let outcome = match action {
+            "state" => return Response::from_json(&generations),
+            "usage" => return Response::from_json(&self.meter().pending().await?),
+            "mint" => {
+                let limit = self
+                    .env
+                    .var("CLIENTMCP_ISSUE_LIMIT")
+                    .ok()
+                    .and_then(|v| v.to_string().parse().ok())
+                    .unwrap_or(ISSUE_LIMIT);
+                generations.issue(limit, ISSUE_WINDOW_MS, now)
+            }
+            "rotate" => {
+                let Some(role) = crate::internal::role(role) else {
+                    return Response::error("`role` is client or agent", 400);
+                };
+                let grace = body.get("grace_ms").and_then(Value::as_u64).unwrap_or(0);
+                generations.rotate(role, grace, now).map(|_| ())
+            }
+            "revoke" => {
+                let roles: &[Role] = match role {
+                    "client" => &[Role::Client],
+                    "agent" => &[Role::Agent],
+                    _ => &[Role::Client, Role::Agent],
+                };
+                let mut result = Ok(());
+                for role in roles {
+                    if let Err(refusal) = generations.revoke(*role).map(|_| ()) {
+                        result = Err(refusal);
+                        break;
+                    }
+                }
+                result
+            }
+            "delete" => {
+                generations.delete();
+                Ok(())
+            }
+            _ => return Response::error("not found", 404),
+        };
+        if let Err(refusal) = outcome {
+            let (status, reason) = match refusal {
+                Refusal::Deleted => (410, "the client was deleted"),
+                Refusal::TooMany => (429, "too many tokens minted for this client; try later"),
+                Refusal::Grace => (400, "a grace is for the agent token, at most 24 hours"),
+            };
+            return Response::error(reason, status);
+        }
+        self.state.storage().put(GENERATIONS, &generations).await?;
+        // What no longer holds goes now, not at its next connect.
+        let ended_client = match action {
+            "rotate" => role == "client",
+            "revoke" => role != "agent",
+            "delete" => true,
+            _ => false,
+        };
+        let ended_agent = match action {
+            "rotate" => {
+                role == "agent" && body.get("grace_ms").and_then(Value::as_u64).unwrap_or(0) == 0
+            }
+            "revoke" => role != "client",
+            "delete" => true,
+            _ => false,
+        };
+        if ended_client {
+            self.load().await;
+            for ws in self.state.get_websockets_with_tag(CLIENT) {
+                let _ = ws.close(Some(CLOSE_UNAUTHORIZED), Some("token revoked or replaced"));
+                self.ended(&ws).await?;
+            }
+        }
+        if ended_agent {
+            for ws in self.state.get_websockets_with_tag(LISTENER) {
+                let _ = ws.close(Some(1000), Some("token revoked or replaced"));
+            }
+        }
+        Response::from_json(&json!({
+            "client": generations.client,
+            "agent": generations.agent,
+            "deleted": generations.deleted,
+        }))
+    }
+
     /// A client connection. The newest one wins (SPEC §3.1).
     async fn accept_client(&self) -> Result<Response> {
         self.load().await;
@@ -199,9 +361,15 @@ impl ClientObject {
             }
         }
         // Dropping the previous session fails its calls in flight.
+        let replaced = previous.is_some();
         if previous.is_some_and(|p| !p.session.tools().is_empty()) {
             self.announce();
         }
+        // A replaced connection's time ends where the new one's begins.
+        if replaced {
+            self.meter().disconnected().await;
+        }
+        self.meter().connected().await;
         websocket_response(pair.client)
     }
 
@@ -226,6 +394,8 @@ impl ClientObject {
         // A client gone silent is gone: its tools are not offered, and a call
         // to it is told it is offline at once.
         self.close_if_silent(idle).await?;
+        let started = Date::now().as_millis();
+        let mut called: Option<(String, Ended)> = None;
         let response = match agent::parse(&method, &headers, &body) {
             Op::Reply(response) => response,
             Op::Describe(describe) => {
@@ -245,7 +415,17 @@ impl ClientObject {
                     .as_ref()
                     .is_some_and(|key| self.was_cancelled(key))
                 {
-                    return convert(call.respond(agent::Outcome::Cancelled));
+                    let response = call.respond(agent::Outcome::Cancelled);
+                    self.meter()
+                        .call(
+                            Ended::Cancelled,
+                            &call.name,
+                            body.len(),
+                            response.body.len(),
+                            0,
+                        )
+                        .await;
+                    return convert(response);
                 }
                 let timeout =
                     Delay::from(config(&self.env).map_err(Error::RustError)?.call_timeout);
@@ -255,19 +435,21 @@ impl ClientObject {
                 // goes silent while the call waits is closed, and the call
                 // told so.
                 let gone = either_or(aborted(&req), self.silent(idle));
-                match either_or(session::call(self, &call, timeout), gone).await {
-                    Ok(outcome) => call.respond(outcome),
+                let outcome = match either_or(session::call(self, &call, timeout), gone).await {
+                    Ok(outcome) => outcome,
                     Err(Ok(())) => {
                         console_log!(
                             "clientmcp: the Worker's request went away; its call is cancelled"
                         );
-                        call.respond(agent::Outcome::Cancelled)
+                        agent::Outcome::Cancelled
                     }
                     Err(Err(())) => {
                         self.close_if_silent(idle).await?;
-                        call.respond(agent::Outcome::Disconnected)
+                        agent::Outcome::Disconnected
                     }
-                }
+                };
+                called = Some((call.name.clone(), Ended::of(&outcome)));
+                call.respond(outcome)
             }
             Op::Cancel(key) => {
                 self.with(|s| s.map(|s| s.cancel(&key)));
@@ -277,6 +459,16 @@ impl ClientObject {
                 CoreResponse::text(500, "notification streams are served by the Worker")
             }
         };
+        let meter = self.meter();
+        match called {
+            Some((tool, ended)) => {
+                let ms = Date::now().as_millis().saturating_sub(started);
+                meter
+                    .call(ended, &tool, body.len(), response.body.len(), ms)
+                    .await;
+            }
+            None => meter.request(body.len(), response.body.len()).await,
+        }
         convert(response)
     }
 
@@ -326,6 +518,7 @@ impl ClientObject {
         match current {
             Some(true) => {
                 let ended = self.current.take();
+                self.meter().disconnected().await;
                 self.state.storage().delete(REGISTER).await?;
                 if ended.is_some_and(|e| !e.session.tools().is_empty()) {
                     self.announce();
@@ -334,6 +527,7 @@ impl ClientObject {
             Some(false) => {} // a replaced connection
             // Closed while the object hibernated: only storage remembers the client.
             None => {
+                self.meter().disconnected().await;
                 if self.state.storage().delete(REGISTER).await? {
                     self.announce();
                 }
@@ -431,6 +625,16 @@ impl ClientObject {
     fn is_client(&self, ws: &WebSocket) -> bool {
         self.state.get_tags(ws).iter().any(|t| t == CLIENT)
     }
+}
+
+/// The generation of the token the Worker verified; 0 when it said none.
+fn presented_generation(req: &Request) -> u64 {
+    req.headers()
+        .get(GENERATION)
+        .ok()
+        .flatten()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(0)
 }
 
 fn serial(ws: &WebSocket) -> String {

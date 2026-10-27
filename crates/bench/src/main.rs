@@ -69,6 +69,7 @@ async fn main() {
             role,
             exp: None,
             nbf: None,
+            generation: None,
         })
     };
     let ws_url = format!("{}/connect", args.url.replacen("http", "ws", 1));

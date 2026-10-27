@@ -29,3 +29,24 @@ CLIENTMCP_ALLOWED_ORIGINS = ""
 #   wrangler secret put CLIENTMCP_SECRET
 # For `wrangler dev`, put it in .dev.vars:
 #   CLIENTMCP_SECRET=<at least 32 bytes>
+
+# Self-serve tokens (docs/self-serve.md). The database is created at the first
+# deploy with these (`wrangler d1 create clientmcp-bridge`, then its ID here);
+# until then the placeholder serves local runs only. Every binding below is
+# optional at runtime: without one, the bridge works as before.
+[[d1_databases]]
+binding = "BRIDGE_DB"
+database_name = "clientmcp-bridge"
+database_id = "00000000-0000-0000-0000-000000000000"
+migrations_dir = "migrations"
+
+[[analytics_engine_datasets]]
+binding = "SIGNALS"
+dataset = "clientmcp_signals"
+
+# The protective rate limit: only against blatant abuse.
+[[ratelimits]]
+name = "AGENT_LIMIT"
+namespace_id = "1001"
+simple = { limit = 600, period = 60 }
+

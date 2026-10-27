@@ -5,6 +5,8 @@
 //! lives in its Durable Object ([`client_object`]), addressed by client ID.
 
 mod client_object;
+mod internal;
+mod metering;
 
 use std::cell::RefCell;
 use std::future::Future;
@@ -29,6 +31,13 @@ pub use client_object::ClientObject;
 const KEEPALIVE: Duration = Duration::from_secs(25);
 /// Header carrying a call's cancellation key to the client's object.
 pub(crate) const CANCEL_KEY: &str = "x-clientmcp-cancel-key";
+/// Header carrying the presented token's generation to the client's object,
+/// which keeps the generations (`docs/self-serve.md`). Always set by the
+/// Worker, over anything a request arrived with.
+pub(crate) const GENERATION: &str = "x-clientmcp-generation";
+/// Header naming the client to its object, which does not know its own name
+/// (metering writes it beside the counts). Always set by the Worker.
+pub(crate) const CLIENT_ID: &str = "x-clientmcp-client";
 
 #[event(fetch)]
 async fn fetch(req: Request, env: Env, ctx: Context) -> Result<Response> {
@@ -37,6 +46,9 @@ async fn fetch(req: Request, env: Env, ctx: Context) -> Result<Response> {
         Err(e) => return Response::error(format!("bridge misconfigured: {e}"), 500),
     };
     let path = req.path();
+    if path.starts_with("/internal/") {
+        return internal::handle(req, &env, &config, now()).await;
+    }
     match http::route(&path) {
         Route::Connect => connect(req, &env, &config).await,
         Route::Mcp { token } => {
@@ -58,25 +70,41 @@ async fn connect(req: Request, env: &Env, config: &Config) -> Result<Response> {
     {
         return convert(http::Response::text(426, "expected a WebSocket upgrade"));
     }
-    match http::accept_client(config, &headers, now()) {
-        Ok(id) => {
+    match http::accept_client_bound(config, &headers, now()) {
+        Ok(bound) => {
+            let forwarded = with_generation(&req, &bound.client, bound.generation)?;
             clients(env)?
-                .get_by_name(&id)?
-                .fetch_with_request(req)
+                .get_by_name(&bound.client)?
+                .fetch_with_request(forwarded)
                 .await
         }
         Err(ClientRefusal::NotClientMcp) => convert(http::Response::text(
             400,
             &format!("offer the {SUBPROTOCOL} subprotocol and a token"),
         )),
-        Err(ClientRefusal::Unauthorized) => {
-            let pair = WebSocketPair::new()?;
-            pair.server.accept()?;
-            pair.server
-                .close(Some(CLOSE_UNAUTHORIZED), Some("invalid or expired token"))?;
-            websocket_response(pair.client)
-        }
+        Err(ClientRefusal::Unauthorized) => refuse_client("invalid or expired token"),
     }
+}
+
+/// A handshake completed only to say why it is refused: `4401` (SPEC §3.3).
+pub(crate) fn refuse_client(reason: &str) -> Result<Response> {
+    let pair = WebSocketPair::new()?;
+    pair.server.accept()?;
+    pair.server.close(Some(CLOSE_UNAUTHORIZED), Some(reason))?;
+    websocket_response(pair.client)
+}
+
+/// The client's handshake, for its object, carrying its token's generation.
+fn with_generation(req: &Request, client: &str, generation: u64) -> Result<Request> {
+    let headers = req.headers().clone();
+    headers.set(GENERATION, &generation.to_string())?;
+    headers.set(CLIENT_ID, client)?;
+    let init = RequestInit {
+        method: req.method(),
+        headers,
+        ..RequestInit::default()
+    };
+    Request::new_with_init(req.url()?.as_ref(), &init)
 }
 
 /// The agent endpoint (SPEC §4).
@@ -97,14 +125,20 @@ async fn agent(
     if body.len() > MAX_MESSAGE_BYTES {
         return convert(http::Response::text(413, "request body too large"));
     }
-    let mut response = match agent::parse(&method, &headers, &body) {
+    let response = match agent::parse(&method, &headers, &body) {
         Op::Reply(response) => convert(response)?,
         Op::Listen(listen) => listen_stream(env, &admitted, listen).await?,
         Op::CallTool(call) => {
+            // The protective rate limit (docs/self-serve.md): only against
+            // blatant abuse, and said to the model as a tool error.
+            if limited(env, &admitted.client).await {
+                signal_limited(env, &admitted.client, &call.name);
+                return with_cors(convert(call.respond(agent::Outcome::Limited))?, &admitted);
+            }
             let key = call
                 .cancel_key
                 .unwrap_or_else(|| clientmcp_core::random_hex(8));
-            let forwarded = forward(&req, &body, Some(&key))?;
+            let forwarded = forward(&req, &body, Some(&key), &admitted)?;
             let stub = clients(env)?.get_by_name(&admitted.client)?;
             let pending = Box::pin(async move { stub.fetch_with_request(forwarded).await });
             let canceller = Canceller::new(ctx, clients(env)?.get_by_name(&admitted.client)?, key);
@@ -127,13 +161,17 @@ async fn agent(
         }
         // Everything else needs the client's state.
         _ => {
-            let forwarded = forward(&req, &body, None)?;
+            let forwarded = forward(&req, &body, None, &admitted)?;
             clients(env)?
                 .get_by_name(&admitted.client)?
                 .fetch_with_request(forwarded)
                 .await?
         }
     };
+    with_cors(response, &admitted)
+}
+
+fn with_cors(mut response: Response, admitted: &Admitted) -> Result<Response> {
     if let Some(origin) = &admitted.cors {
         for (name, value) in http::cors_headers(origin) {
             response.headers_mut().append(name, &value)?;
@@ -142,9 +180,38 @@ async fn agent(
     Ok(response)
 }
 
+/// Whether the client's calls are over the protective limit. No binding, or
+/// a limiter that fails to answer, limits nothing.
+async fn limited(env: &Env, client: &str) -> bool {
+    let Ok(limiter) = env.rate_limiter("AGENT_LIMIT") else {
+        return false;
+    };
+    matches!(limiter.limit(client.to_owned()).await, Ok(outcome) if !outcome.success)
+}
+
+/// A limited call never reaches the client's object, so its signal is the
+/// Worker's.
+fn signal_limited(env: &Env, client: &str, tool: &str) {
+    if let Ok(dataset) = env.analytics_engine("SIGNALS") {
+        let point = AnalyticsEngineDataPointBuilder::new()
+            .indexes([client])
+            .blobs([client, "call", "limited", tool])
+            .doubles([0.0, 0.0, 0.0])
+            .build();
+        let _ = dataset.write_data_point(&point);
+    }
+}
+
 /// The request for the client's object, carrying the agent's request.
-fn forward(req: &Request, body: &[u8], cancel_key: Option<&str>) -> Result<Request> {
+fn forward(
+    req: &Request,
+    body: &[u8],
+    cancel_key: Option<&str>,
+    admitted: &Admitted,
+) -> Result<Request> {
     let headers = req.headers().clone();
+    headers.set(GENERATION, &admitted.generation.to_string())?;
+    headers.set(CLIENT_ID, &admitted.client)?;
     if let Some(key) = cancel_key {
         headers.set(CANCEL_KEY, key)?;
     }
@@ -275,6 +342,8 @@ fn sse_response(response: Response) -> Result<Response> {
 async fn listen_stream(env: &Env, admitted: &Admitted, listen: Listen) -> Result<Response> {
     let upgrade = Headers::new();
     upgrade.set("upgrade", "websocket")?;
+    upgrade.set(GENERATION, &admitted.generation.to_string())?;
+    upgrade.set(CLIENT_ID, &admitted.client)?;
     let init = RequestInit {
         headers: upgrade,
         ..RequestInit::default()
