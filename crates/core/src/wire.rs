@@ -88,6 +88,13 @@ impl ToolResult {
             .starts_with('[')
             .then_some(ToolResult(members))
     }
+
+    /// Whether the client answered with a tool error (`isError: true`).
+    pub fn is_error(&self) -> bool {
+        self.0
+            .get("isError")
+            .is_some_and(|v| v.get().trim() == "true")
+    }
 }
 
 /// The `call` message. `arguments` is a JSON object, forwarded verbatim.

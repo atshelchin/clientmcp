@@ -39,6 +39,19 @@ pub struct Claims {
     pub exp: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub nbf: Option<u64>,
+    /// The token's generation for its client and role (`docs/self-serve.md`):
+    /// a bridge that keeps generations accepts only the current one. Absent
+    /// is generation 0, so a token minted before generations keeps working
+    /// until its client is first rotated. Other bridges ignore it (SPEC §2).
+    #[serde(rename = "gen", default, skip_serializing_if = "Option::is_none")]
+    pub generation: Option<u64>,
+}
+
+/// What a verified token grants: the client it is bound to and its generation.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Bound {
+    pub client: String,
+    pub generation: u64,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -114,11 +127,19 @@ impl Keys {
     /// Verifies `token` and returns the client ID it is bound to, if it carries `role`.
     /// `now` is the current Unix time in seconds.
     pub fn verify(&self, token: &str, role: Role, now: u64) -> Result<String, TokenError> {
+        self.bind(token, role, now).map(|bound| bound.client)
+    }
+
+    /// [`Keys::verify`], with the token's generation (0 when it carries none).
+    pub fn bind(&self, token: &str, role: Role, now: u64) -> Result<Bound, TokenError> {
         let claims = self.claims(token, now)?;
         if claims.role != role {
             return Err(TokenError::Role);
         }
-        Ok(claims.sub)
+        Ok(Bound {
+            client: claims.sub,
+            generation: claims.generation.unwrap_or(0),
+        })
     }
 
     fn claims(&self, token: &str, now: u64) -> Result<Claims, TokenError> {
@@ -199,7 +220,27 @@ mod tests {
             role,
             exp: Some(1_000),
             nbf: None,
+            generation: None,
         }
+    }
+
+    /// `docs/self-serve.md`: a token with no `gen` is generation 0 — every
+    /// token minted before generations keeps working — and the claim's name
+    /// on the wire is `gen`, which bridges without generations ignore.
+    #[test]
+    fn generations() {
+        let old = keys().sign(&claims(Role::Agent));
+        assert_eq!(keys().bind(&old, Role::Agent, 0).unwrap().generation, 0);
+        let new = keys().sign(&Claims {
+            generation: Some(3),
+            ..claims(Role::Agent)
+        });
+        let bound = keys().bind(&new, Role::Agent, 0).unwrap();
+        assert_eq!((bound.client.as_str(), bound.generation), ("alice", 3));
+        assert_eq!(keys().verify(&new, Role::Agent, 0).unwrap(), "alice");
+        let payload = new.split('.').nth(1).unwrap();
+        let json = String::from_utf8(B64.decode(payload).unwrap()).unwrap();
+        assert!(json.contains("\"gen\":3"), "{json}");
     }
 
     #[test]

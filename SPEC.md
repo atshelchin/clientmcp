@@ -84,6 +84,14 @@ An agent token for client `X` grants calling every tool `X` declares, whenever
 client channel and on every request for the agent endpoint. An established
 client connection is not closed when its token later expires.
 
+A bridge MAY keep, per client and per role, a current **generation** and
+accept only tokens whose `gen` claim (a non-negative integer; absent means 0)
+equals it. Raising a client's generation for a role then revokes every token
+of that role minted before, without rotating the secret; such a bridge closes
+a client connection whose token it no longer accepts (`4401`). A bridge that
+keeps no generations ignores `gen` like any other unknown claim. The reference
+Worker keeps them (`docs/self-serve.md`).
+
 ## 3. Client channel
 
 ### 3.1 Connecting
@@ -406,7 +414,7 @@ document its limits. The reference bridge uses:
   page is exposed to any script on that page; prefer short-lived tokens issued
   by the application's backend (the SDK accepts a token function that is called
   on every connection). Revoking tokens before `exp` requires rotating the
-  secret.
+  secret, or a bridge that keeps generations (§2).
 - **The client is the authority.** It decides which tools exist, validates
   every argument, and SHOULD ask the user to confirm consequential actions.
   `arguments` are written by a language model that may be manipulated by
@@ -420,14 +428,20 @@ document its limits. The reference bridge uses:
 - *Cloudflare Workers.* One Durable Object per client ID holds the client
   WebSocket through the Hibernation API, so an idle client costs nothing. The
   exact-text ping is answered by `setWebSocketAutoResponse` without waking the
-  object. Notification streams are held by the stateless Worker, which listens
+  object. Since those pings never reach the object, it reads when a client was
+  last heard from as the later of its last message and the platform's record
+  of the last auto-response (`getWebSocketAutoResponseTimestamp`), and closes
+  a client silent for the idle limit — on any agent request, and every few
+  seconds while a call waits — as a bridge that sees the pings does. Notification streams are held by the stateless Worker, which listens
   to the Durable Object over an internal hibernatable WebSocket, so an agent
   waiting for changes does not keep the object awake either. The tool set is
   kept in Durable Object storage only so that it survives hibernation; it is
   deleted when the client disconnects. The Worker notices an agent hanging up
-  on a streamed call when a keep-alive write fails, and asks the object to
-  cancel the call. When the platform restarts an object (e.g. on deploy), its
-  streams end without the final result and agents listen again.
+  on a call by the request's abort signal, or on a streamed call when a
+  keep-alive write fails, and asks the object to cancel the call; a cancel
+  that overtakes its call cancels it on arrival. When the platform restarts
+  an object (e.g. on deploy), its streams end without the final result and
+  agents listen again.
 - *Single process.* A map from client ID to connection, with a notification
   channel per client, is the whole state. A single instance serves all
   clients; running several instances requires routing all requests for a

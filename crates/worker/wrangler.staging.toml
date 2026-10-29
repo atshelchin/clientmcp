@@ -1,0 +1,53 @@
+# The staging bridge (bridge-staging.clientmcp.dev): production's config with
+# its own name, route, database, dataset and secrets. The staging site
+# (staging.clientmcp.dev) binds to it. Deploy with `-c wrangler.staging.toml`.
+name = "clientmcp-staging"
+main = "build/worker/shim.mjs"
+compatibility_date = "2026-05-01"
+# Request.signal on incoming requests: how a hang-up before a call's answer is
+# seen (src/lib.rs, on_abort).
+compatibility_flags = ["enable_request_signal"]
+routes = [{ pattern = "bridge-staging.clientmcp.dev", custom_domain = true }]
+
+[build]
+command = "worker-build --release"
+
+[[durable_objects.bindings]]
+name = "CLIENTS"
+class_name = "ClientObject"
+
+[[migrations]]
+tag = "v1"
+new_sqlite_classes = ["ClientObject"]
+
+[vars]
+# Tool call timeout in seconds.
+CLIENTMCP_CALL_TIMEOUT = "120"
+# A client that sends nothing for this long is presumed gone (SPEC §3.2).
+CLIENTMCP_CLIENT_IDLE = "90"
+# Browser origins allowed on /mcp: comma-separated, or "*". Empty allows none.
+CLIENTMCP_ALLOWED_ORIGINS = ""
+
+# The token secret is a secret, not a var:
+#   wrangler secret put CLIENTMCP_SECRET
+# For `wrangler dev`, put it in .dev.vars:
+#   CLIENTMCP_SECRET=<at least 32 bytes>
+
+# Self-serve tokens (docs/self-serve.md). Every binding below is optional at
+# runtime: without one, the bridge works as before.
+[[d1_databases]]
+binding = "BRIDGE_DB"
+database_name = "clientmcp-bridge-staging"
+database_id = "873d53ff-75eb-485a-8cc0-f8208433a0b0"
+migrations_dir = "migrations"
+
+[[analytics_engine_datasets]]
+binding = "SIGNALS"
+dataset = "clientmcp_signals_staging"
+
+# The protective rate limit: only against blatant abuse.
+[[ratelimits]]
+name = "AGENT_LIMIT"
+namespace_id = "1002"
+simple = { limit = 600, period = 60 }
+

@@ -15,9 +15,6 @@ use tokio_tungstenite::tungstenite::{Error, Message};
 
 use crate::hub::{Hub, Out, Outbox};
 
-/// A client that sends nothing for this long is presumed gone (SPEC §3.2).
-const IDLE_TIMEOUT: Duration = Duration::from_secs(90);
-
 type Socket = WebSocketStream<TokioIo<Upgraded>>;
 
 pub async fn accept(upgraded: Upgraded) -> Socket {
@@ -45,7 +42,8 @@ pub async fn refuse(mut socket: Socket) {
 /// Serves a connection for client `id` until it ends. A writer task drains
 /// the session's outbox while this task reads, so a busy client's calls and
 /// results flow in parallel.
-pub async fn serve(hub: Arc<Hub>, id: String, socket: Socket) {
+/// A client that sends nothing for `idle` is presumed gone (SPEC §3.2).
+pub async fn serve(hub: Arc<Hub>, id: String, socket: Socket, idle: Duration) {
     let (mut sink, mut stream) = socket.split();
     let (tx, mut rx) = mpsc::unbounded_channel();
     let outbox = Outbox(tx);
@@ -67,7 +65,7 @@ pub async fn serve(hub: Arc<Hub>, id: String, socket: Socket) {
     });
 
     let close = loop {
-        let text = match tokio::time::timeout(IDLE_TIMEOUT, stream.next()).await {
+        let text = match tokio::time::timeout(idle, stream.next()).await {
             Err(_) => break Some((1000, "idle".into())),
             Ok(Some(Ok(Message::Text(text)))) => text,
             // Ping and pong frames are answered by tungstenite.

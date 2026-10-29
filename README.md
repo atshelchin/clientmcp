@@ -58,6 +58,15 @@ mcp.expose("add_todo", {
 await mcp.connect();
 ```
 
+Rust applications (desktop, or a mobile app's core) use `clientmcp-client`
+(`crates/client`), with the same protocol and behaviour:
+
+```rust
+let mcp = Client::new(Options::new("ws://localhost:8080/connect", client_token));
+mcp.expose("add_todo", Tool::new(move |args, _ctx| add_todo(args)).description("Add a todo"));
+mcp.connect().await?;
+```
+
 **4. Connect an agent**, e.g. Claude Code:
 
 ```sh
@@ -95,14 +104,35 @@ One Durable Object per client ID holds its WebSocket through the Hibernation
 API; pings are answered at the edge and agents' notification streams are held
 by the Worker, so a connected but idle application does not keep anything awake.
 
+The Worker can also issue and revoke tokens itself, meter use per client and
+hold back blatant abuse: the self-serve tokens of
+[docs/self-serve.md](docs/self-serve.md). All of it is optional. Without the
+bindings and the service secret below, the Worker behaves as before. To turn it
+on, create the database once and apply its migrations:
+
+```sh
+npx wrangler d1 create clientmcp-bridge     # put its ID in wrangler.toml
+npx wrangler d1 migrations apply BRIDGE_DB --remote
+npx wrangler secret put CLIENTMCP_SERVICE_SECRET
+```
+
+| Binding       | What it is for                                                           |
+| ------------- | ------------------------------------------------------------------------ |
+| `BRIDGE_DB`   | D1: exact daily usage per client, and the issuance audit.                |
+| `SIGNALS`     | Analytics Engine: one data point per call, connection or refusal, for live views and alerts (sampled by the platform; nothing depends on it being complete). |
+| `AGENT_LIMIT` | Rate limiting: calls per client per minute, answered as a tool error past the limit. |
+
 ### Configuration
 
 | Variable                    | Default          | Meaning                                                                 |
 | --------------------------- | ---------------- | ----------------------------------------------------------------------- |
 | `CLIENTMCP_SECRET`          | — (required)     | Token secrets, ≥ 32 bytes, newest first, space-separated for rotation.  |
 | `CLIENTMCP_CALL_TIMEOUT`    | `120`            | Seconds before an unanswered call fails and is cancelled.               |
+| `CLIENTMCP_CLIENT_IDLE`     | `90`             | Seconds an application may send nothing (pings included) before it is presumed gone and closed; its calls fail then, not at the call timeout. |
 | `CLIENTMCP_ALLOWED_ORIGINS` | none             | Browser origins allowed on `/mcp` (comma-separated, or `*`).            |
 | `CLIENTMCP_LISTEN`          | `127.0.0.1:8080` | Listen address (server only; the image uses `0.0.0.0:8080`).            |
+| `CLIENTMCP_SERVICE_SECRET`  | none             | Worker only: ≥ 32 bytes; opens the internal issuance API (`/internal/`) to a caller presenting it, such as the site over a Service Binding. Absent, that API answers `404`. |
+| `CLIENTMCP_ISSUE_LIMIT`     | `30`             | Worker only: tokens the internal API may mint per client per hour.     |
 
 Endpoints: `/connect` (applications), `/mcp` and `/mcp/<token>` (agents), `/health`.
 
@@ -119,6 +149,11 @@ library:
 `my-app`. In production, have your backend issue short-lived client tokens
 (the SDK accepts a token function, called on every reconnection) and give
 agents tokens with an `exp`. See [SPEC.md §2](SPEC.md#2-tokens) and §7.
+
+A token may also carry `gen`, its generation. The Worker keeps each client's
+current generation per role and refuses older tokens, so one client's tokens
+can be revoked without rotating the secret (SPEC §2). A token without `gen` is
+generation 0: tokens minted before generations keep working.
 
 ## Protocol
 
@@ -142,19 +177,29 @@ tools; agents stay connected and are notified when it returns.
 cargo test --workspace --exclude clientmcp-worker   # core unit tests
 tests/run-native.sh                                  # conformance suite vs. the server
 tests/run-worker.sh                                  # conformance suite vs. the Worker in workerd
+tests/run-self-serve.sh                              # generations, issuance, metering, rate limit (Worker)
+CLIENTMCP_APP=rust tests/run-native.sh               # the same, with the Rust client as the application
 ```
 
-The conformance suite (`tests/`, 33 cases) drives a bridge with the official
+The conformance suite (`tests/`, 34 cases) drives a bridge with the official
 MCP SDKs as agents — v1 (2025 era) and v2 (2026-07-28, pinned and
-auto-negotiated) — and this repository's SDK as the application. It covers
+auto-negotiated) — and this repository's SDK as the application; with
+`CLIENTMCP_APP=rust` the Rust client plays the application instead (its
+handlers stay in the suite, the Rust client does all of the protocol). It covers
 authentication, origin checks and CORS, both MCP eras, header validation,
 `x-mcp-header`, notification streams, streamed slow calls, concurrency,
 timeouts, cancellation in both eras (checked before the call timeout could
 cancel instead), disconnection, replacement, size limits and tool validation. It
-passes unchanged against the native server, the Docker image and the Worker
-running in workerd. Beyond the suite: the browser example was exercised end to
-end in Chrome — agent changes appeared in the UI, user edits were visible to the
-agent, a declined confirmation reached the agent as a tool error, and the page
+passes unchanged against the native server, the Docker image, the Worker
+running in workerd and the deployed Worker (`bridge.clientmcp.dev`, where the
+call-timeout case is skipped: it needs `CLIENTMCP_CALL_TIMEOUT` of 5 or less).
+`tests/run-idle.sh` runs `idle.test.mjs` against the native server and the
+Worker in workerd with a 3-second client idle: a call to an application that
+went silent fails at the idle limit, its tools stop being offered, and one that
+keeps pinging is kept.
+Beyond the suite: the browser example was exercised end to end in Chrome —
+agent changes appeared in the UI, user edits were visible to the agent, a
+declined confirmation reached the agent as a tool error, and the page
 reconnected and re-registered after a bridge restart — and Claude Code, as a
 real agent, listed and added todos in a running application through the bridge.
 
@@ -190,6 +235,7 @@ crates/core        protocol logic shared by both runtimes, no I/O
 crates/server      the Linux/Docker bridge (tokio, hyper, tokio-tungstenite)
 crates/worker      the Cloudflare bridge (workers-rs, Durable Objects)
 sdk/js             the TypeScript SDK for applications
+crates/client      the Rust client for applications, as sdk/js
 tests              the conformance suite
 crates/bench       the load generator
 examples/browser   a shared todo list

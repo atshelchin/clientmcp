@@ -12,8 +12,10 @@ export default defineConfig({
 					filename.split(/[/\\]/).includes('node_modules') ? undefined : true
 			},
 			adapter: adapter(),
-			// Pages are prerendered, so this is what url.origin is when they are built.
-			paths: { origin: 'https://clientmcp.dev' }
+			// Pages are prerendered, so this is what url.origin is when they are
+			// built; Kit also checks form posts against it (CSRF). Staging and the
+			// local end-to-end run build with their own (SITE_ORIGIN).
+			paths: { origin: process.env.SITE_ORIGIN ?? 'https://clientmcp.dev' }
 		})
 	],
 	// The docs are the repository's Markdown files, one directory up.

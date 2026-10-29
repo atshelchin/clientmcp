@@ -5,7 +5,7 @@ use base64::Engine;
 use base64::engine::general_purpose::STANDARD;
 
 use crate::Config;
-use crate::token::Role;
+use crate::token::{Bound, Role};
 use crate::wire::SUBPROTOCOL;
 
 /// Request headers with lowercase names.
@@ -150,6 +150,15 @@ pub fn accept_client(
     headers: &Headers,
     now: u64,
 ) -> Result<String, ClientRefusal> {
+    accept_client_bound(config, headers, now).map(|bound| bound.client)
+}
+
+/// [`accept_client`], with the token's generation.
+pub fn accept_client_bound(
+    config: &Config,
+    headers: &Headers,
+    now: u64,
+) -> Result<Bound, ClientRefusal> {
     let offered: Vec<&str> = headers
         .get("sec-websocket-protocol")
         .unwrap_or_default()
@@ -163,7 +172,7 @@ pub fn accept_client(
     match (tokens.next(), tokens.next()) {
         (Some(token), None) => config
             .keys
-            .verify(token, Role::Client, now)
+            .bind(token, Role::Client, now)
             .map_err(|_| ClientRefusal::Unauthorized),
         _ => Err(ClientRefusal::Unauthorized),
     }
@@ -173,6 +182,8 @@ pub fn accept_client(
 #[derive(Debug)]
 pub struct Admitted {
     pub client: String,
+    /// The agent token's generation (0 when it carries none).
+    pub generation: u64,
     /// The `Origin` to answer with CORS headers, if the request came from a browser.
     pub cors: Option<String>,
 }
@@ -204,19 +215,24 @@ pub fn admit_agent(
         scheme.eq_ignore_ascii_case("bearer").then(|| token.trim())
     });
     let admitted = token
-        .and_then(|token| config.keys.verify(token, Role::Agent, now).ok())
-        .map(|client| Admitted {
-            client,
+        .and_then(|token| config.keys.bind(token, Role::Agent, now).ok())
+        .map(|bound| Admitted {
+            client: bound.client,
+            generation: bound.generation,
             cors: cors.clone(),
         });
-    admitted.ok_or_else(|| {
-        let mut response = Response::text(401, "a valid agent token is required")
-            .header("www-authenticate", "Bearer");
-        if let Some(origin) = &cors {
-            add_cors(&mut response, origin);
-        }
-        response
-    })
+    admitted.ok_or_else(|| unauthorized_agent(cors.as_deref()))
+}
+
+/// The agent endpoint's `401`: no valid agent token — or, on a bridge that
+/// keeps generations, one its client has since rotated or revoked.
+pub fn unauthorized_agent(cors: Option<&str>) -> Response {
+    let mut response =
+        Response::text(401, "a valid agent token is required").header("www-authenticate", "Bearer");
+    if let Some(origin) = cors {
+        add_cors(&mut response, origin);
+    }
+    response
 }
 
 fn preflight(origin: &str, headers: &Headers) -> Response {
@@ -301,6 +317,7 @@ mod tests {
         Config {
             keys: Keys::parse("0123456789abcdef0123456789abcdef").unwrap(),
             call_timeout: Duration::from_secs(1),
+            client_idle: Duration::from_secs(90),
             origins: Origins::parse("https://app.example, https://b.example/"),
         }
     }
@@ -311,6 +328,7 @@ mod tests {
             role,
             exp: None,
             nbf: None,
+            generation: None,
         })
     }
 

@@ -7,6 +7,9 @@ import { StreamableHTTPClientTransport as LegacyTransport } from "@modelcontextp
 import { Client as ModernClient, StreamableHTTPClientTransport as ModernTransport } from "@modelcontextprotocol/client";
 import { ClientMCP } from "../sdk/js/dist/index.js";
 
+// The application: the JS SDK, or the Rust client with CLIENTMCP_APP=rust.
+const App = process.env.CLIENTMCP_APP === "rust" ? (await import("./rust-app.mjs")).RustApp : ClientMCP;
+
 export const BRIDGE = (process.env.BRIDGE_URL ?? "http://127.0.0.1:8080").replace(/\/$/, "");
 export const SECRET = (process.env.CLIENTMCP_SECRET ?? "").trim().split(/\s+/)[0];
 export const CALL_TIMEOUT = Number(process.env.CLIENTMCP_CALL_TIMEOUT ?? 120);
@@ -49,7 +52,7 @@ export async function closeAll() {
 /** Starts an application exposing `tools`, and waits until it is online. */
 export async function startApp(id, tools = {}, options = {}) {
   const statuses = [];
-  const app = new ClientMCP({
+  const app = new App({
     url: WS_URL,
     token: mint("client", id),
     onStatus: (status, detail) => statuses.push({ status, ...detail }),

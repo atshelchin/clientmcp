@@ -433,6 +433,8 @@ pub enum Outcome {
     Busy,
     /// The agent cancelled the call.
     Cancelled,
+    /// Held back by a bridge's protective rate limit (`docs/self-serve.md`).
+    Limited,
 }
 
 impl Call {
@@ -472,6 +474,9 @@ impl Call {
                 self.failed("The application has too many tool calls in progress. Try again later.")
             }
             Outcome::Cancelled => self.failed("The tool call was cancelled."),
+            Outcome::Limited => self.failed(
+                "This application is receiving too many tool calls. Slow down and try again in a minute.",
+            ),
         }
     }
 

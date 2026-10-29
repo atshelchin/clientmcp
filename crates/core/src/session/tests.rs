@@ -242,12 +242,16 @@ fn legacy_cancellation_and_busy() {
     let request = legacy_call("echo", Some("s1"));
     let mut future = pin!(call(&slot, &request, pending::<()>()));
     assert!(poll(future.as_mut()).is_pending());
-    slot.with(|s| s.unwrap().cancel(request.cancel_key.as_ref().unwrap()));
+    let key = request.cancel_key.as_ref().unwrap();
+    assert!(slot.with(|s| s.unwrap().cancel(key)));
     assert_eq!(sent.take()[1]["type"], "cancel");
     assert!(matches!(
         poll(future.as_mut()),
         Poll::Ready(Outcome::Cancelled)
     ));
+    // Nothing in flight under that key any more (the Worker remembers such a
+    // cancel until its call arrives).
+    assert!(!slot.with(|s| s.unwrap().cancel(key)));
 
     slot.with(|s| {
         let s = s.unwrap();

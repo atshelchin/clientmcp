@@ -92,6 +92,7 @@ fn token(args: &[String]) -> Result<(), String> {
         role,
         exp,
         nbf: None,
+        generation: None,
     };
     println!("{}", config()?.keys.sign(&claims));
     Ok(())

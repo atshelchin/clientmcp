@@ -10,5 +10,48 @@
 	},
 	"routes": [{ "pattern": "clientmcp.dev", "custom_domain": true }],
 	"workers_dev": true,
-	"preview_urls": true
+	"preview_urls": true,
+	// Self-serve tokens (docs/self-serve.md). Secrets, set with `wrangler
+	// secret put`: SERVICE_SECRET (the bridge's CLIENTMCP_SERVICE_SECRET),
+	// GITHUB_CLIENT_ID, GITHUB_CLIENT_SECRET, SESSION_KEY. The site never holds
+	// the token secret: the bridge signs.
+	"d1_databases": [
+		{
+			"binding": "SITE_DB",
+			"database_name": "clientmcp-site",
+			// Created at the site's first production deploy with these.
+			"database_id": "ef4cd8d0-36e1-46af-97bc-8200d13d3364",
+			"migrations_dir": "migrations"
+		}
+	],
+	"services": [{ "binding": "BRIDGE", "service": "clientmcp" }],
+	"vars": {
+		"BRIDGE_PUBLIC_URL": "wss://bridge.clientmcp.dev/connect",
+		"ADMIN_GITHUB_ID": "113176571"
+	},
+	"env": {
+		// staging.clientmcp.dev, against the staging bridge, with its own
+		// database and its own GitHub OAuth app.
+		"staging": {
+			"name": "clientmcp-website-staging",
+			"routes": [{ "pattern": "staging.clientmcp.dev", "custom_domain": true }],
+			"workers_dev": false,
+			"preview_urls": false,
+			"d1_databases": [
+				{
+					"binding": "SITE_DB",
+					"database_name": "clientmcp-site-staging",
+					"database_id": "e04e1f23-f0da-4f54-8964-38bc46a7fb52",
+					"migrations_dir": "migrations"
+				}
+			],
+			"services": [{ "binding": "BRIDGE", "service": "clientmcp-staging" }],
+			"vars": {
+				"BRIDGE_PUBLIC_URL": "wss://bridge-staging.clientmcp.dev/connect",
+				"ADMIN_GITHUB_ID": "113176571",
+				// A wallet's local development server may exchange codes (never in production).
+				"TOKEN_CORS_LOOPBACK": "1"
+			}
+		}
+	}
 }

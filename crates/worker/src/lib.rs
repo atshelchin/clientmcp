@@ -5,7 +5,10 @@
 //! lives in its Durable Object ([`client_object`]), addressed by client ID.
 
 mod client_object;
+mod internal;
+mod metering;
 
+use std::cell::RefCell;
 use std::future::Future;
 use std::pin::{Pin, pin};
 use std::rc::Rc;
@@ -17,8 +20,10 @@ use clientmcp_core::http::{
     self, Admitted, ClientRefusal, Headers as CoreHeaders, Route, SSE_HEADERS, SSE_KEEPALIVE,
 };
 use clientmcp_core::wire::{CLOSE_UNAUTHORIZED, MAX_MESSAGE_BYTES, SUBPROTOCOL};
-use futures_channel::mpsc;
+use futures_channel::{mpsc, oneshot};
 use futures_util::{SinkExt, StreamExt};
+use wasm_bindgen::JsCast;
+use wasm_bindgen::closure::Closure;
 use worker::*;
 
 pub use client_object::ClientObject;
@@ -26,6 +31,13 @@ pub use client_object::ClientObject;
 const KEEPALIVE: Duration = Duration::from_secs(25);
 /// Header carrying a call's cancellation key to the client's object.
 pub(crate) const CANCEL_KEY: &str = "x-clientmcp-cancel-key";
+/// Header carrying the presented token's generation to the client's object,
+/// which keeps the generations (`docs/self-serve.md`). Always set by the
+/// Worker, over anything a request arrived with.
+pub(crate) const GENERATION: &str = "x-clientmcp-generation";
+/// Header naming the client to its object, which does not know its own name
+/// (metering writes it beside the counts). Always set by the Worker.
+pub(crate) const CLIENT_ID: &str = "x-clientmcp-client";
 
 #[event(fetch)]
 async fn fetch(req: Request, env: Env, ctx: Context) -> Result<Response> {
@@ -34,6 +46,9 @@ async fn fetch(req: Request, env: Env, ctx: Context) -> Result<Response> {
         Err(e) => return Response::error(format!("bridge misconfigured: {e}"), 500),
     };
     let path = req.path();
+    if path.starts_with("/internal/") {
+        return internal::handle(req, &env, &config, now()).await;
+    }
     match http::route(&path) {
         Route::Connect => connect(req, &env, &config).await,
         Route::Mcp { token } => {
@@ -55,25 +70,41 @@ async fn connect(req: Request, env: &Env, config: &Config) -> Result<Response> {
     {
         return convert(http::Response::text(426, "expected a WebSocket upgrade"));
     }
-    match http::accept_client(config, &headers, now()) {
-        Ok(id) => {
+    match http::accept_client_bound(config, &headers, now()) {
+        Ok(bound) => {
+            let forwarded = with_generation(&req, &bound.client, bound.generation)?;
             clients(env)?
-                .get_by_name(&id)?
-                .fetch_with_request(req)
+                .get_by_name(&bound.client)?
+                .fetch_with_request(forwarded)
                 .await
         }
         Err(ClientRefusal::NotClientMcp) => convert(http::Response::text(
             400,
             &format!("offer the {SUBPROTOCOL} subprotocol and a token"),
         )),
-        Err(ClientRefusal::Unauthorized) => {
-            let pair = WebSocketPair::new()?;
-            pair.server.accept()?;
-            pair.server
-                .close(Some(CLOSE_UNAUTHORIZED), Some("invalid or expired token"))?;
-            websocket_response(pair.client)
-        }
+        Err(ClientRefusal::Unauthorized) => refuse_client("invalid or expired token"),
     }
+}
+
+/// A handshake completed only to say why it is refused: `4401` (SPEC §3.3).
+pub(crate) fn refuse_client(reason: &str) -> Result<Response> {
+    let pair = WebSocketPair::new()?;
+    pair.server.accept()?;
+    pair.server.close(Some(CLOSE_UNAUTHORIZED), Some(reason))?;
+    websocket_response(pair.client)
+}
+
+/// The client's handshake, for its object, carrying its token's generation.
+fn with_generation(req: &Request, client: &str, generation: u64) -> Result<Request> {
+    let headers = req.headers().clone();
+    headers.set(GENERATION, &generation.to_string())?;
+    headers.set(CLIENT_ID, client)?;
+    let init = RequestInit {
+        method: req.method(),
+        headers,
+        ..RequestInit::default()
+    };
+    Request::new_with_init(req.url()?.as_ref(), &init)
 }
 
 /// The agent endpoint (SPEC §4).
@@ -94,40 +125,53 @@ async fn agent(
     if body.len() > MAX_MESSAGE_BYTES {
         return convert(http::Response::text(413, "request body too large"));
     }
-    let mut response = match agent::parse(&method, &headers, &body) {
+    let response = match agent::parse(&method, &headers, &body) {
         Op::Reply(response) => convert(response)?,
         Op::Listen(listen) => listen_stream(env, &admitted, listen).await?,
         Op::CallTool(call) => {
+            // The protective rate limit (docs/self-serve.md): only against
+            // blatant abuse, and said to the model as a tool error.
+            if limited(env, &admitted.client).await {
+                signal_limited(env, &admitted.client, &call.name);
+                return with_cors(convert(call.respond(agent::Outcome::Limited))?, &admitted);
+            }
             let key = call
                 .cancel_key
                 .unwrap_or_else(|| clientmcp_core::random_hex(8));
-            let forwarded = forward(&req, &body, Some(&key))?;
+            let forwarded = forward(&req, &body, Some(&key), &admitted)?;
             let stub = clients(env)?.get_by_name(&admitted.client)?;
             let pending = Box::pin(async move { stub.fetch_with_request(forwarded).await });
+            let canceller = Canceller::new(ctx, clients(env)?.get_by_name(&admitted.client)?, key);
+            // An agent hanging up before the answer: on Cloudflare the
+            // invocation then ends without dropping anything, so only the
+            // request's signal says so (the `enable_request_signal` flag).
+            let on_hang_up = canceller.clone();
+            on_abort(&req, move || {
+                if on_hang_up.cancel() {
+                    console_log!("clientmcp: an agent hung up; its call is cancelled");
+                }
+            });
             if call.streamable {
-                let canceller = clients(env)?.get_by_name(&admitted.client)?;
-                stream_call(
-                    pending,
-                    CancelOnDrop {
-                        ctx,
-                        stub: Some(canceller),
-                        key,
-                    },
-                )
-                .await?
+                stream_call(pending, CancelOnDrop(canceller)).await?
             } else {
-                pending.await?
+                let response = pending.await;
+                canceller.disarm();
+                response?
             }
         }
         // Everything else needs the client's state.
         _ => {
-            let forwarded = forward(&req, &body, None)?;
+            let forwarded = forward(&req, &body, None, &admitted)?;
             clients(env)?
                 .get_by_name(&admitted.client)?
                 .fetch_with_request(forwarded)
                 .await?
         }
     };
+    with_cors(response, &admitted)
+}
+
+fn with_cors(mut response: Response, admitted: &Admitted) -> Result<Response> {
     if let Some(origin) = &admitted.cors {
         for (name, value) in http::cors_headers(origin) {
             response.headers_mut().append(name, &value)?;
@@ -136,9 +180,38 @@ async fn agent(
     Ok(response)
 }
 
+/// Whether the client's calls are over the protective limit. No binding, or
+/// a limiter that fails to answer, limits nothing.
+async fn limited(env: &Env, client: &str) -> bool {
+    let Ok(limiter) = env.rate_limiter("AGENT_LIMIT") else {
+        return false;
+    };
+    matches!(limiter.limit(client.to_owned()).await, Ok(outcome) if !outcome.success)
+}
+
+/// A limited call never reaches the client's object, so its signal is the
+/// Worker's.
+fn signal_limited(env: &Env, client: &str, tool: &str) {
+    if let Ok(dataset) = env.analytics_engine("SIGNALS") {
+        let point = AnalyticsEngineDataPointBuilder::new()
+            .indexes([client])
+            .blobs([client, "call", "limited", tool])
+            .doubles([0.0, 0.0, 0.0])
+            .build();
+        let _ = dataset.write_data_point(&point);
+    }
+}
+
 /// The request for the client's object, carrying the agent's request.
-fn forward(req: &Request, body: &[u8], cancel_key: Option<&str>) -> Result<Request> {
+fn forward(
+    req: &Request,
+    body: &[u8],
+    cancel_key: Option<&str>,
+    admitted: &Admitted,
+) -> Result<Request> {
     let headers = req.headers().clone();
+    headers.set(GENERATION, &admitted.generation.to_string())?;
+    headers.set(CLIENT_ID, &admitted.client)?;
     if let Some(key) = cancel_key {
         headers.set(CANCEL_KEY, key)?;
     }
@@ -154,7 +227,8 @@ fn forward(req: &Request, body: &[u8], cancel_key: Option<&str>) -> Result<Reque
 /// Answers a call (SPEC §4.3). One that takes longer than [`CALL_KEEPALIVE`]
 /// becomes an SSE stream of keep-alive comments ending with the response: a
 /// write to an agent that has gone away cancels the stream, which drops
-/// `cancel`, which tells the client's object to cancel the call.
+/// `cancel`, which tells the client's object to cancel the call. (A hang-up
+/// before that is the request's abort signal's, see [`agent`].)
 async fn stream_call(
     mut pending: Pin<Box<impl Future<Output = Result<Response>> + 'static>>,
     mut cancel: CancelOnDrop,
@@ -180,24 +254,29 @@ async fn stream_call(
     sse_response(Response::from_stream(events)?)
 }
 
-/// Tells the client's object to cancel a call, unless disarmed first.
-struct CancelOnDrop {
-    ctx: Rc<Context>,
-    stub: Option<Stub>,
-    key: String,
-}
+/// Tells the client's object to cancel a call, once, unless disarmed first.
+#[derive(Clone)]
+struct Canceller(Rc<RefCell<Option<Cancel>>>);
 
-impl CancelOnDrop {
-    fn disarm(&mut self) {
-        self.stub = None;
+/// What a cancel needs: the invocation to keep alive, the object, the key.
+type Cancel = (Rc<Context>, Stub, String);
+
+impl Canceller {
+    fn new(ctx: Rc<Context>, stub: Stub, key: String) -> Self {
+        Canceller(Rc::new(RefCell::new(Some((ctx, stub, key)))))
     }
-}
 
-impl Drop for CancelOnDrop {
-    fn drop(&mut self) {
-        let Some(stub) = self.stub.take() else { return };
+    fn disarm(&self) {
+        self.0.borrow_mut().take();
+    }
+
+    /// Whether this sent the cancel (it was neither disarmed nor sent).
+    fn cancel(&self) -> bool {
+        let Some((ctx, stub, key)) = self.0.borrow_mut().take() else {
+            return false;
+        };
         let headers = Headers::new();
-        let _ = headers.set(CANCEL_KEY, &self.key);
+        let _ = headers.set(CANCEL_KEY, &key);
         let init = RequestInit {
             method: Method::Post,
             headers,
@@ -205,10 +284,47 @@ impl Drop for CancelOnDrop {
         };
         if let Ok(req) = Request::new_with_init("https://client/cancel", &init) {
             // The agent is gone; `wait_until` keeps the Worker running to deliver this.
-            self.ctx.wait_until(async move {
+            ctx.wait_until(async move {
                 let _ = stub.fetch_with_request(req).await;
             });
         }
+        true
+    }
+}
+
+/// Cancels the call when dropped, unless disarmed first.
+struct CancelOnDrop(Canceller);
+
+impl CancelOnDrop {
+    fn disarm(&mut self) {
+        self.0.disarm();
+    }
+}
+
+impl Drop for CancelOnDrop {
+    fn drop(&mut self) {
+        self.0.cancel();
+    }
+}
+
+/// Runs `f` if the request's sender goes away before the response is done.
+pub(crate) fn on_abort(req: &Request, f: impl FnOnce() + 'static) {
+    let signal = req.inner().signal();
+    if signal.aborted() {
+        return f();
+    }
+    let listener = Closure::once_into_js(f);
+    signal.set_onabort(Some(listener.unchecked_ref()));
+}
+
+/// Resolves if the request's sender goes away before the response is done.
+pub(crate) async fn aborted(req: &Request) {
+    let (tx, rx) = oneshot::channel();
+    on_abort(req, move || {
+        let _ = tx.send(());
+    });
+    if rx.await.is_err() {
+        std::future::pending::<()>().await; // never aborted
     }
 }
 
@@ -226,6 +342,8 @@ fn sse_response(response: Response) -> Result<Response> {
 async fn listen_stream(env: &Env, admitted: &Admitted, listen: Listen) -> Result<Response> {
     let upgrade = Headers::new();
     upgrade.set("upgrade", "websocket")?;
+    upgrade.set(GENERATION, &admitted.generation.to_string())?;
+    upgrade.set(CLIENT_ID, &admitted.client)?;
     let init = RequestInit {
         headers: upgrade,
         ..RequestInit::default()
@@ -308,7 +426,10 @@ pub(crate) fn websocket_response(client: WebSocket) -> Result<Response> {
         .empty())
 }
 
-async fn either_or<A: Future, B: Future>(a: A, b: B) -> std::result::Result<A::Output, B::Output> {
+pub(crate) async fn either_or<A: Future, B: Future>(
+    a: A,
+    b: B,
+) -> std::result::Result<A::Output, B::Output> {
     let mut a = pin!(a);
     let mut b = pin!(b);
     std::future::poll_fn(|cx| {
